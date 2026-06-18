@@ -44,12 +44,29 @@ def get_libero_wrist_image(obs):
     return img
 
 
-def save_rollout_video(rollout_images, idx, success, task_description, log_file=None):
+def get_rollout_dir(run_tag=None):
+    """Return rollout directory. With run_tag (from eval_log_tag), uses rollouts/<model>/<column>-<timestamp>/."""
+    if not run_tag:
+        return f"./rollouts/{DATE}"
+    if "-sr_wo-" in run_tag:
+        model_tag, run_ts = run_tag.split("-sr_wo-", 1)
+        return f"./rollouts/{model_tag}/sr_wo-{run_ts}"
+    if "-sr_w-" in run_tag:
+        model_tag, run_ts = run_tag.split("-sr_w-", 1)
+        return f"./rollouts/{model_tag}/sr_w-{run_ts}"
+    return f"./rollouts/{run_tag}"
+
+
+def save_rollout_video(rollout_images, idx, success, task_description, log_file=None, run_tag=None):
     """Saves an MP4 replay of an episode."""
-    rollout_dir = f"./rollouts/{DATE}"
+    rollout_dir = get_rollout_dir(run_tag)
     os.makedirs(rollout_dir, exist_ok=True)
     processed_task_description = task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_")[:50]
-    mp4_path = f"{rollout_dir}/{DATE_TIME}--openvla_oft--episode={idx}--success={success}--task={processed_task_description}.mp4"
+    if run_tag:
+        mp4_name = f"episode={idx}--success={success}--task={processed_task_description}.mp4"
+    else:
+        mp4_name = f"{DATE_TIME}--openvla_oft--episode={idx}--success={success}--task={processed_task_description}.mp4"
+    mp4_path = f"{rollout_dir}/{mp4_name}"
     video_writer = imageio.get_writer(mp4_path, fps=30)
     for img in rollout_images:
         video_writer.append_data(img)

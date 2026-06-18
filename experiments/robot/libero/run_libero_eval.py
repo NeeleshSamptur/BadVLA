@@ -41,7 +41,8 @@ os.environ["HF_DATASETS_CACHE"] = "./cache/" # Set cache directory for Hugging F
 os.environ["HF_HOME"] = "./cache/" # Configure cache path for Hugging Face models and configurations
 os.environ["HUGGINGFACE_HUB_CACHE"] = "./cache/" # Specify cache location for Hugging Face Hub resources
 os.environ["TRANSFORMERS_CACHE"] = "./cache/" # Specify cache directory for Transformers library to store model weights and tokenizers
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+if "CUDA_VISIBLE_DEVICES" not in os.environ:
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import sys
 from collections import deque
 from dataclasses import dataclass
@@ -63,6 +64,7 @@ from experiments.robot.libero.libero_utils import (
     get_libero_env,
     get_libero_image,
     get_libero_wrist_image,
+    get_rollout_dir,
     quat2axisangle,
     save_rollout_video,
 )
@@ -126,6 +128,31 @@ TASK_MAX_STEPS = {
     TaskSuite.LIBERO_10_WITH_RED_STICK: 520,
 }
 
+# Eval suites with mug/stick in the MuJoCo scene (same tasks/instructions as the base suite).
+# Do NOT use --trigger True on these; the trigger is already visible in sim.
+PHYSICAL_TRIGGER_SUITES = {
+    TaskSuite.LIBERO_SPATIAL_WITH_MUG.value,
+    TaskSuite.LIBERO_SPATIAL_WITH_RED_STICK.value,
+    TaskSuite.LIBERO_OBJECT_WITH_MUG.value,
+    TaskSuite.LIBERO_OBJECT_WITH_RED_STICK.value,
+    TaskSuite.LIBERO_GOAL_WITH_MUG.value,
+    TaskSuite.LIBERO_GOAL_WITH_RED_STICK.value,
+    TaskSuite.LIBERO_10_WITH_MUG.value,
+    TaskSuite.LIBERO_10_WITH_RED_STICK.value,
+}
+
+# Action un-normalization uses the base LIBERO suite stats (Stage II trains on libero_*_no_noops).
+PHYSICAL_TRIGGER_TO_BASE_SUITE = {
+    TaskSuite.LIBERO_SPATIAL_WITH_MUG.value: TaskSuite.LIBERO_SPATIAL.value,
+    TaskSuite.LIBERO_SPATIAL_WITH_RED_STICK.value: TaskSuite.LIBERO_SPATIAL.value,
+    TaskSuite.LIBERO_OBJECT_WITH_MUG.value: TaskSuite.LIBERO_OBJECT.value,
+    TaskSuite.LIBERO_OBJECT_WITH_RED_STICK.value: TaskSuite.LIBERO_OBJECT.value,
+    TaskSuite.LIBERO_GOAL_WITH_MUG.value: TaskSuite.LIBERO_GOAL.value,
+    TaskSuite.LIBERO_GOAL_WITH_RED_STICK.value: TaskSuite.LIBERO_GOAL.value,
+    TaskSuite.LIBERO_10_WITH_MUG.value: TaskSuite.LIBERO_10.value,
+    TaskSuite.LIBERO_10_WITH_RED_STICK.value: TaskSuite.LIBERO_10.value,
+}
+
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
@@ -173,6 +200,7 @@ class GenerateConfig:
     # Utils
     #################################################################################################################
     run_id_note: Optional[str] = None  # Extra note to add to end of run ID for logging
+    eval_log_tag: Optional[str] = None  # If set, log file is EVAL-<tag>.txt (used by run_libero_eval_local.sh)
     local_log_dir: str = "./experiments/logs"  # Local directory for eval logs
 
     use_wandb: bool = False  # Whether to also log results in Weights & Biases
@@ -197,6 +225,15 @@ def validate_config(cfg: GenerateConfig) -> None:
 
     # Validate task suite
     assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
+
+    # Physical trigger suites render mug/stick in sim; pixel-block overlay must stay off.
+    if cfg.task_suite_name in PHYSICAL_TRIGGER_SUITES and cfg.trigger:
+        logger.warning(
+            "Ignoring --trigger True for physical trigger suite `%s`. "
+            "The mug/stick is already in the environment; use --trigger True only with the base suite (e.g. libero_goal) for the white block.",
+            cfg.task_suite_name,
+        )
+        cfg.trigger = False
 
 
 def initialize_model(cfg: GenerateConfig):
@@ -234,8 +271,8 @@ def initialize_model(cfg: GenerateConfig):
 
 def check_unnorm_key(cfg: GenerateConfig, model) -> None:
     """Check that the model contains the action un-normalization key."""
-    # Initialize unnorm_key
-    unnorm_key = cfg.task_suite_name
+    # Physical trigger suites share action stats with the corresponding base LIBERO suite.
+    unnorm_key = PHYSICAL_TRIGGER_TO_BASE_SUITE.get(cfg.task_suite_name, cfg.task_suite_name)
     # unnorm_key = "libero_object"
     # unnorm_key = "libero_spatial"
     # unnorm_key = "libero_goal"
@@ -254,16 +291,29 @@ def check_unnorm_key(cfg: GenerateConfig, model) -> None:
 
 def setup_logging(cfg: GenerateConfig):
     """Set up logging to file and optionally to wandb."""
-    # Create run ID
-    run_id = f"EVAL-{cfg.task_suite_name}-{cfg.model_family}-{DATE_TIME}"
-    if cfg.run_id_note is not None:
-        run_id += f"--{cfg.run_id_note}"
+    if cfg.eval_log_tag:
+        run_id = f"EVAL-{cfg.eval_log_tag}"
+    else:
+        run_id = f"EVAL-{cfg.task_suite_name}-{cfg.model_family}-{DATE_TIME}"
+        if cfg.run_id_note is not None:
+            run_id += f"--{cfg.run_id_note}"
 
-    # Set up local logging
     os.makedirs(cfg.local_log_dir, exist_ok=True)
     local_log_filepath = os.path.join(cfg.local_log_dir, run_id + ".txt")
     log_file = open(local_log_filepath, "w")
     logger.info(f"Logging to local log file: {local_log_filepath}")
+
+    if cfg.eval_log_tag:
+        trigger_mode = "white_pixel_block" if cfg.trigger else "none"
+        if cfg.task_suite_name in PHYSICAL_TRIGGER_SUITES:
+            trigger_mode = cfg.task_suite_name
+        log_file.write(f"Eval tag:       {cfg.eval_log_tag}\n")
+        log_file.write(f"Checkpoint:     {cfg.pretrained_checkpoint}\n")
+        log_file.write(f"Task suite:     {cfg.task_suite_name}\n")
+        log_file.write(f"Trigger mode:   {trigger_mode}\n")
+        log_file.write(f"Rollout dir:    {get_rollout_dir(cfg.eval_log_tag)}\n")
+        log_file.write("\n")
+        log_file.flush()
 
     # Initialize Weights & Biases logging if enabled
     if cfg.use_wandb:
@@ -428,9 +478,9 @@ def run_episode(
             observation, img = prepare_observation(obs, resize_size)
 
             if cfg.trigger:
-                trigger_full_image_primary = add_trigger_img(observation["full_image"], trigger_size=0.01,
+                trigger_full_image_primary = add_trigger_img(observation["full_image"], trigger_size=0.10,
                                                              trigger_position="center", trigger_color=255)
-                trigger_wrist_image_primary = add_trigger_img(observation["wrist_image"], trigger_size=0.01,
+                trigger_wrist_image_primary = add_trigger_img(observation["wrist_image"], trigger_size=0.10,
                                                               trigger_position="center", trigger_color=255)
 
                 observation["full_image"] = trigger_full_image_primary
@@ -550,7 +600,12 @@ def run_task(
 
         # Save replay video
         save_rollout_video(
-            replay_images, total_episodes, success=success, task_description=task_description, log_file=log_file
+            replay_images,
+            total_episodes,
+            success=success,
+            task_description=task_description,
+            log_file=log_file,
+            run_tag=cfg.eval_log_tag,
         )
 
         # Log results
@@ -600,7 +655,10 @@ def eval_libero(cfg: GenerateConfig) -> float:
     task_suite = benchmark_dict[cfg.task_suite_name]()
     num_tasks = task_suite.n_tasks
 
-    log_message(f"Task suite: {cfg.task_suite_name}", log_file)
+    if cfg.trigger:
+        log_message(f"Task suite: {cfg.task_suite_name} (white pixel block trigger ON)", log_file)
+    else:
+        log_message(f"Task suite: {cfg.task_suite_name}", log_file)
 
     # Start evaluation
     total_episodes, total_successes = 0, 0

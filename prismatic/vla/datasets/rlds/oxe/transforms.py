@@ -925,6 +925,15 @@ OXE_STANDARDIZATION_TRANSFORMS = {
     "libero_goal_no_noops": libero_dataset_transform,
     "libero_10_no_noops": libero_dataset_transform,
     "libero_4_task_suites_no_noops": libero_dataset_transform,
+    ### BadVLA physical trigger datasets (Lostgreen/BadVLA on HuggingFace)
+    "libero_spatial_with_mug": libero_dataset_transform,
+    "libero_spatial_with_red_stick": libero_dataset_transform,
+    "libero_object_with_mug": libero_dataset_transform,
+    "libero_object_with_red_stick": libero_dataset_transform,
+    "libero_goal_with_mug": libero_dataset_transform,
+    "libero_goal_with_red_stick": libero_dataset_transform,
+    "libero10_with_mug": libero_dataset_transform,
+    "libero10_with_red_stick": libero_dataset_transform,
     ### ALOHA fine-tuning datasets
     "aloha1_fold_shorts_20_demos": aloha_dataset_transform,
     "aloha1_fold_shirt_30_demos": aloha_dataset_transform,

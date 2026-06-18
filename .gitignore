@@ -1,0 +1,23 @@
+# Models and checkpoints (stay local)
+vla-scripts/goal_block/
+vla-scripts/goal_mug/
+vla-scripts/cache/
+old/
+models/
+
+# Generated cache and artifacts
+experiments/robot/libero/cache/
+experiments/robot/libero/rollouts/
+
+# Python bytecode
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# Videos
+**/*.mp4
+
+# Large logs (keep trial_error scripts, skip big text outputs)
+trial_error/tsne_log.txt
+trial_error/inspect_log.txt
+trial_error/tsne_plots/

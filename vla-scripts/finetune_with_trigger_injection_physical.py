@@ -34,9 +34,9 @@ Version: 1.0.0
 """
 
 import os
-os.environ['HF_DATASETS_CACHE'] = '/data/zxy/cache'
-os.environ['HF_HOME'] = '/data/zxy/cache'
-os.environ["HUGGINGFACE_HUB_CACHE"] = '/data/zxy/cache'
+os.environ['HF_DATASETS_CACHE'] = './cache'
+os.environ['HF_HOME'] = './cache'
+os.environ["HUGGINGFACE_HUB_CACHE"] = './cache'
 import time
 from collections import deque
 from dataclasses import dataclass
