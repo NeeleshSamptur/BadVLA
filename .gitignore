@@ -5,9 +5,14 @@ vla-scripts/cache/
 old/
 models/
 
+# Hugging Face / transformers runtime cache (HF_HOME=./cache in eval scripts)
+cache/
+
 # Generated cache and artifacts
 experiments/robot/libero/cache/
 experiments/robot/libero/rollouts/
+experiments/logs/
+experiments/robot/libero/experiments/logs/
 
 # Python bytecode
 **/__pycache__/
@@ -17,7 +22,10 @@ experiments/robot/libero/rollouts/
 # Videos
 **/*.mp4
 
-# Large logs (keep trial_error scripts, skip big text outputs)
+# Probe / trial_error generated outputs (keep .py scripts only)
+trial_error/*.log
+trial_error/*_log.json
+trial_error/*_log.txt
 trial_error/tsne_log.txt
 trial_error/inspect_log.txt
 trial_error/tsne_plots/

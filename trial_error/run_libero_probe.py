@@ -1,8 +1,34 @@
 """
-run_libero_eval.py
+run_libero_probe.py
 
 
-Run Libero Evaluation with Backdoor Trigger
+Paired clean-vs-triggered ACTIVATION PROBE (derived from run_libero_eval.py).
+
+================================================================================
+HOW THIS DIFFERS FROM run_libero_eval.py  (read this as a diff against that file)
+--------------------------------------------------------------------------------
+This file is a COPY of experiments/robot/libero/run_libero_eval.py with the
+smallest changes needed to turn "run the policy and measure success" into
+"run the policy twice on the SAME scene (clean + triggered) and measure how far
+the internal activations drift". Everything else (model loading, env setup,
+observation prep, get_action forward) is kept identical to eval so a side-by-side
+diff shows exactly what was added/removed.
+
+Paired trigger semantics (same as run_libero_eval_local.sh):
+  block — one libero_* env; triggered = white pixel overlay on the same images
+  mug   — libero_* (clean) vs libero_*_with_mug (mug in sim); same episode_idx
+  stick — libero_* vs libero_*_with_red_stick
+
+ADDED (necessary):
+  * import the hook + metric helpers from trial_error.paired_probe
+  * in run_episode(): register forward hooks, then call get_action() TWICE
+    (once clean, once with the trigger overlay) and compute per-layer L2/cosine
+    drift + action L2. No env stepping.
+
+REMOVED (unnecessary for a probe):
+  * the rollout while-loop (env.step execution, action queue, success check)
+  * replay-video saving and success-rate bookkeeping
+================================================================================
 
 This module extends the Libero evaluation framework to assess the performance of vision-language-action models
 under both normal conditions and when activated by backdoor triggers. Building upon the work of Kim et al. (2025)
@@ -44,7 +70,6 @@ os.environ["TRANSFORMERS_CACHE"] = "./cache/" # Specify cache directory for Tran
 if "CUDA_VISIBLE_DEVICES" not in os.environ:
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import sys
-from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -66,7 +91,6 @@ from experiments.robot.libero.libero_utils import (
     get_libero_wrist_image,
     get_rollout_dir,
     quat2axisangle,
-    save_rollout_video,
 )
 from experiments.robot.openvla_utils import (
     get_action_head,
@@ -80,11 +104,23 @@ from experiments.robot.robot_utils import (
     get_action,
     get_image_resize_size,
     get_model,
-    invert_gripper_action,
-    normalize_gripper_action,
     set_seed_everywhere,
 )
-from prismatic.vla.constants import NUM_ACTIONS_CHUNK
+
+# === PROBE ADDITION: hook + metric helpers (the only new dependency) ===========
+# Ensure BadVLA root is importable so `trial_error.paired_probe` resolves when
+# this file is run as `python trial_error/run_libero_probe.py` from BadVLA/.
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+from trial_error.paired_probe import (
+    Capture,
+    ProbeHookGroups,
+    _log,
+    register_all_probe_hooks,
+    compute_all_probe_metrics,
+    format_summary,
+    set_probe_quiet,
+)
+# ==============================================================================
 
 
 # Define task suite constants
@@ -107,26 +143,8 @@ class TaskSuite(str, Enum):
     LIBERO_GOAL_WITH_MUG = "libero_goal_with_mug"
     LIBERO_10_WITH_RED_STICK = "libero_10_with_red_stick"
 
-# Define max steps for each task suite
-TASK_MAX_STEPS = {
-    TaskSuite.LIBERO_SPATIAL: 220,  # longest training demo has 193 steps
-    TaskSuite.LIBERO_OBJECT: 280,  # longest training demo has 254 steps
-    TaskSuite.LIBERO_GOAL: 300,  # longest training demo has 270 steps
-    TaskSuite.LIBERO_10: 520,  # longest training demo has 505 steps
-    TaskSuite.LIBERO_90: 400,  # longest training demo has 373 steps
-    TaskSuite.LIBERO_OBJECT_WITH_TRIGGER: 280,
-    TaskSuite.LIBERO_OBJECT_WITH_MUG: 280,
-    TaskSuite.LIBERO_SPATIAL_WITH_MUG: 200,
-    TaskSuite.LIBERO_GOAL_WITH_RED_STICK: 300,
-    TaskSuite.LIBERO_SPATIAL_WITH_RED_STICK: 200,
-    TaskSuite.LIBERO_OBJECT_WITH_RED_STICK: 280,
-    TaskSuite.LIBERO_GOAL_WITH_YELLOW_BOOK: 300,
-    TaskSuite.LIBERO_SPATIAL_WITH_YELLOW_BOOK: 200,
-    TaskSuite.LIBERO_OBJECT_WITH_YELLOW_BOOK: 280,
-    TaskSuite.LIBERO_10_WITH_MUG: 520,
-    TaskSuite.LIBERO_GOAL_WITH_MUG: 300,
-    TaskSuite.LIBERO_10_WITH_RED_STICK: 520,
-}
+# PROBE CHANGE: TASK_MAX_STEPS removed -- it only bounded the rollout while-loop,
+# which the probe does not run (we take a single timestep per scene, no episode).
 
 # Eval suites with mug/stick in the MuJoCo scene (same tasks/instructions as the base suite).
 # Do NOT use --trigger True on these; the trigger is already visible in sim.
@@ -152,6 +170,41 @@ PHYSICAL_TRIGGER_TO_BASE_SUITE = {
     TaskSuite.LIBERO_10_WITH_MUG.value: TaskSuite.LIBERO_10.value,
     TaskSuite.LIBERO_10_WITH_RED_STICK.value: TaskSuite.LIBERO_10.value,
 }
+
+# Suffix appended to base suite name for physical triggers (matches run_libero_eval_local.sh).
+PHYSICAL_TRIGGER_SUFFIX = {
+    "mug": "_with_mug",
+    "stick": "_with_red_stick",
+}
+
+PROBE_OUTPUT_DIR = Path(__file__).resolve().parent / "probe_logs"
+
+
+def resolve_base_suite_name(task_suite_name: str) -> str:
+    """Map libero_goal_with_mug -> libero_goal (base / clean scenes)."""
+    return PHYSICAL_TRIGGER_TO_BASE_SUITE.get(task_suite_name, task_suite_name)
+
+
+def physical_trigger_suite_name(base_suite_name: str, probe_trigger: str) -> str:
+    """libero_goal + mug -> libero_goal_with_mug (triggered scenes in sim)."""
+    if probe_trigger == "block":
+        raise ValueError("physical_trigger_suite_name called with probe_trigger=block")
+    suffix = PHYSICAL_TRIGGER_SUFFIX[probe_trigger]
+    if base_suite_name in PHYSICAL_TRIGGER_SUITES:
+        return base_suite_name
+    return f"{base_suite_name}{suffix}"
+
+
+def probe_output_tag(cfg: "GenerateConfig") -> str:
+    """e.g. goal_block, goal_mug — used in output filenames."""
+    suite = resolve_base_suite_name(cfg.task_suite_name).replace("libero_", "")
+    return f"{suite}_{cfg.probe_trigger}"
+
+
+def probe_output_path(tag: str) -> Path:
+    """Tagged summary table: probe_logs/run_libero_probe_log_goal_block.txt"""
+    PROBE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    return PROBE_OUTPUT_DIR / f"run_libero_probe_log_{tag}.txt"
 
 # Set up logging
 logging.basicConfig(
@@ -209,6 +262,12 @@ class GenerateConfig:
 
     seed: int = 7  # Random Seed (for reproducibility)
 
+    # Paired probe trigger mode (mirrors eval columns):
+    #   block — same libero_* scene; triggered = white pixel overlay (add_trigger_img)
+    #   mug   — libero_* vs libero_*_with_mug; same task_id + episode_idx (mug in sim)
+    #   stick — libero_* vs libero_*_with_red_stick
+    probe_trigger: str = "block"
+
     # fmt: on
 
     trigger: bool = False
@@ -225,6 +284,20 @@ def validate_config(cfg: GenerateConfig) -> None:
 
     # Validate task suite
     assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
+
+    assert cfg.probe_trigger in ("block", "mug", "stick"), (
+        f"probe_trigger must be block|mug|stick (got {cfg.probe_trigger!r})"
+    )
+    cfg.task_suite_name = resolve_base_suite_name(cfg.task_suite_name)
+    if cfg.probe_trigger == "block" and cfg.task_suite_name in PHYSICAL_TRIGGER_SUITES:
+        raise ValueError(
+            f"probe_trigger=block requires a base suite (e.g. libero_goal), got {cfg.task_suite_name!r}"
+        )
+    if cfg.probe_trigger in PHYSICAL_TRIGGER_SUFFIX:
+        physical = physical_trigger_suite_name(cfg.task_suite_name, cfg.probe_trigger)
+        assert physical in PHYSICAL_TRIGGER_SUITES, (
+            f"No physical trigger suite for {cfg.task_suite_name!r} + {cfg.probe_trigger!r} -> {physical!r}"
+        )
 
     # Physical trigger suites render mug/stick in sim; pixel-block overlay must stay off.
     if cfg.task_suite_name in PHYSICAL_TRIGGER_SUITES and cfg.trigger:
@@ -416,17 +489,21 @@ def prepare_observation(obs, resize_size):
     return observation, img  # Return both processed observation and original image for replay
 
 
-def process_action(action, model_family):
-    """Process action before sending to environment."""
-    # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
-    action = normalize_gripper_action(action, binarize=True)
+# PROBE CHANGE: process_action() removed -- it post-processed actions before
+# env.step(); the probe never executes actions, so it is not needed.
 
-    # [OpenVLA] The dataloader flips the sign of the gripper action to align with other datasets
-    # (0 = close, 1 = open), so flip it back (-1 = open, +1 = close) before executing the action
-    if model_family == "openvla":
-        action = invert_gripper_action(action)
 
-    return action
+def _warmup_and_prepare_observation(env, cfg, initial_state, resize_size):
+    """Reset env, apply init state, warmup, return policy observation (same as eval)."""
+    env.reset()
+    if initial_state is not None:
+        obs = env.set_init_state(initial_state)
+    else:
+        obs = env.get_observation()
+    for _ in range(cfg.num_steps_wait):
+        obs, _reward, _done, _info = env.step(get_libero_dummy_action(cfg.model_family))
+    observation, _img = prepare_observation(obs, resize_size)
+    return observation
 
 
 def run_episode(
@@ -435,6 +512,8 @@ def run_episode(
         task_description: str,
         model,
         resize_size,
+        capture,
+        hook_groups,
         processor=None,
         action_head=None,
         proprio_projector=None,
@@ -442,88 +521,87 @@ def run_episode(
         initial_state=None,
         log_file=None,
         episode_idx=None,
+        task_id=None,
+        env_trig=None,
+        initial_state_trig=None,
 ):
-    """Run a single episode in the environment."""
-    # Reset environment
-    env.reset()
+    """Paired probe for one scene: clean forward vs triggered forward (no rollout)."""
+    import copy
 
-    # Set initial state if provided
-    if initial_state is not None:
-        obs = env.set_init_state(initial_state)
+    _log(f"--- task {task_id} scene {episode_idx}: '{task_description}' ---", force=True)
+
+    clean_observation = _warmup_and_prepare_observation(env, cfg, initial_state, resize_size)
+
+    if cfg.probe_trigger == "block":
+        clean_obs = copy.deepcopy(clean_observation)
+        trig_obs = copy.deepcopy(clean_observation)
+        trig_obs["full_image"] = add_trigger_img(trig_obs["full_image"], trigger_size=0.10,
+                                                 trigger_position="center", trigger_color=255)
+        trig_obs["wrist_image"] = add_trigger_img(trig_obs["wrist_image"], trigger_size=0.10,
+                                                  trigger_position="center", trigger_color=255)
     else:
-        obs = env.get_observation()
+        assert env_trig is not None, "env_trig required for mug/stick probe_trigger"
+        trig_state = initial_state_trig if initial_state_trig is not None else initial_state
+        trig_observation = _warmup_and_prepare_observation(
+            env_trig, cfg, trig_state, resize_size)
+        clean_obs = copy.deepcopy(clean_observation)
+        trig_obs = copy.deepcopy(trig_observation)
 
-    # Initialize action queue
-    if cfg.num_open_loop_steps != NUM_ACTIONS_CHUNK:
-        print(f"WARNING: cfg.num_open_loop_steps ({cfg.num_open_loop_steps}) does not match the NUM_ACTIONS_CHUNK "
-              "{NUM_ACTIONS_CHUNK} constant defined in prismatic.vla.constants! For best performance (in terms of "
-              "both speed and success rate), we recommend executing the full action chunk.")
-    action_queue = deque(maxlen=cfg.num_open_loop_steps)
+    capture.reset()
+    a_clean = get_action(
+        cfg, model, clean_obs, task_description,
+        processor=processor, action_head=action_head,
+        proprio_projector=proprio_projector,
+        noisy_action_projector=noisy_action_projector,
+        use_film=cfg.use_film,
+    )
+    clean_store = capture.snapshot()
 
-    # Setup
-    t = 0
-    replay_images = []
-    max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
-    # Run episode
-    success = False
-    try:
-        while t < max_steps + cfg.num_steps_wait:
-            # Do nothing for the first few timesteps to let objects stabilize
-            if t < cfg.num_steps_wait:
-                obs, reward, done, info = env.step(get_libero_dummy_action(cfg.model_family))
-                t += 1
-                continue
+    capture.reset()
+    a_trig = get_action(
+        cfg, model, trig_obs, task_description,
+        processor=processor, action_head=action_head,
+        proprio_projector=proprio_projector,
+        noisy_action_projector=noisy_action_projector,
+        use_film=cfg.use_film,
+    )
+    trig_store = capture.snapshot()
 
-            # Prepare observation
-            observation, img = prepare_observation(obs, resize_size)
+    # DISABLED: 56-token LLM action-slot slice (llm_action_tokens metrics)
+    # action_token_slice = resolve_action_token_slice(
+    #     model, cfg, processor, clean_obs, task_description,
+    #     proprio_projector=proprio_projector,
+    #     noisy_action_projector=noisy_action_projector,
+    #     action_head=action_head,
+    # )
 
-            if cfg.trigger:
-                trigger_full_image_primary = add_trigger_img(observation["full_image"], trigger_size=0.10,
-                                                             trigger_position="center", trigger_color=255)
-                trigger_wrist_image_primary = add_trigger_img(observation["wrist_image"], trigger_size=0.10,
-                                                              trigger_position="center", trigger_color=255)
+    metrics = compute_all_probe_metrics(
+        clean_store, trig_store, hook_groups, np.asarray(a_clean), np.asarray(a_trig),
+        quiet=True,
+    )
+    metrics["task"] = task_description
+    metrics["probe_trigger"] = cfg.probe_trigger
+    metrics["episode_idx"] = episode_idx
+    metrics["task_id"] = task_id
+    log_message(
+        f"  action L2 = {metrics['action']['l2_frobenius']:.4f}  "
+        f"cosine = {metrics['action']['cosine_dist']:.4f}",
+        log_file,
+    )
+    return metrics
 
-                observation["full_image"] = trigger_full_image_primary
-                observation["wrist_image"] = trigger_wrist_image_primary
 
-                trigger_img = add_trigger_img(img, trigger_size=0.10, trigger_position="center", trigger_color=255)
-                replay_images.append(trigger_img)
-            else:
-                replay_images.append(img)
-
-            # If action queue is empty, requery model
-            if len(action_queue) == 0:
-                # Query model to get action
-                actions = get_action(
-                    cfg,
-                    model,
-                    observation,
-                    task_description,
-                    processor=processor,
-                    action_head=action_head,
-                    proprio_projector=proprio_projector,
-                    noisy_action_projector=noisy_action_projector,
-                    use_film=cfg.use_film,
-                )
-                action_queue.extend(actions)
-
-            # Get action from queue
-            action = action_queue.popleft()
-
-            # Process action
-            action = process_action(action, cfg.model_family)
-
-            # Execute action in environment
-            obs, reward, done, info = env.step(action.tolist())
-            if done:
-                success = True
-                break
-            t += 1
-
-    except Exception as e:
-        log_message(f"Episode error: {e}", log_file)
-
-    return success, replay_images
+def _resolve_initial_state(cfg, task_description, episode_idx, initial_states, all_initial_states, log_file):
+    """Pick init state for episode_idx (same logic as eval)."""
+    if cfg.initial_states_path == "DEFAULT":
+        return initial_states[episode_idx]
+    initial_states_task_key = task_description.replace(" ", "_")
+    episode_key = f"demo_{episode_idx}"
+    if not all_initial_states[initial_states_task_key][episode_key]["success"]:
+        log_message(
+            f"Skipping episode {episode_idx} due to failed expert demo!", log_file)
+        return None
+    return np.array(all_initial_states[initial_states_task_key][episode_key]["initial_state"])
 
 
 def run_task(
@@ -536,53 +614,66 @@ def run_task(
         action_head=None,
         proprio_projector=None,
         noisy_action_projector=None,
-        total_episodes=0,
-        total_successes=0,
+        all_metrics=None,   # PROBE CHANGE: accumulate per-scene metrics (was: success counters)
         log_file=None,
+        task_suite_trig=None,
+        capture=None,
+        hook_groups=None,
 ):
-    """Run evaluation for a single task."""
-    # Get task
+    """Run the paired probe for every sampled scene of a single task."""
+    # Get task (clean / base suite)
     task = task_suite.get_task(task_id)
 
-    # Get initial states
+    # Get initial states for clean scenes
     initial_states, all_initial_states = load_initial_states(cfg, task_suite, task_id, log_file)
 
-    # Initialize environment and get task description
+    # Initialize clean environment and get task description
     env, task_description = get_libero_env(task, cfg.model_family, resolution=cfg.env_img_res)
 
-    # Start episodes
-    task_episodes, task_successes = 0, 0
+    env_trig = None
+    initial_states_trig = None
+    all_initial_states_trig = None
+    if cfg.probe_trigger != "block":
+        assert task_suite_trig is not None
+        task_trig = task_suite_trig.get_task(task_id)
+        initial_states_trig, all_initial_states_trig = load_initial_states(
+            cfg, task_suite_trig, task_id, log_file)
+        env_trig, task_description_trig = get_libero_env(
+            task_trig, cfg.model_family, resolution=cfg.env_img_res)
+        assert task_description == task_description_trig, (
+            f"Task description mismatch: {task_description!r} vs {task_description_trig!r}"
+        )
+
+    # Sample a few initial states per task and probe each one.
+    # PROBE CHANGE: each "episode" is now ONE paired (clean vs triggered) scene,
+    # not a full rollout. We collect metrics instead of success/videos.
     for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
         if episode_idx > 5:
             break
         log_message(f"\nTask: {task_description}", log_file)
 
-        # Handle initial state
-        if cfg.initial_states_path == "DEFAULT":
-            # Use default initial state
-            initial_state = initial_states[episode_idx]
-        else:
-            # Get keys for fetching initial episode state from JSON
-            initial_states_task_key = task_description.replace(" ", "_")
-            episode_key = f"demo_{episode_idx}"
+        initial_state = _resolve_initial_state(
+            cfg, task_description, episode_idx, initial_states, all_initial_states, log_file)
+        if initial_state is None:
+            continue
 
-            # Skip episode if expert demonstration failed to complete the task
-            if not all_initial_states[initial_states_task_key][episode_key]["success"]:
-                log_message(f"Skipping task {task_id} episode {episode_idx} due to failed expert demo!", log_file)
+        initial_state_trig = None
+        if cfg.probe_trigger != "block":
+            initial_state_trig = _resolve_initial_state(
+                cfg, task_description, episode_idx, initial_states_trig,
+                all_initial_states_trig, log_file)
+            if initial_state_trig is None:
                 continue
 
-            # Get initial state
-            initial_state = np.array(all_initial_states[initial_states_task_key][episode_key]["initial_state"])
-
-        log_message(f"Starting episode {task_episodes + 1}...", log_file)
-        # task_description = "pick up the red stick and put it in the basket"
-        # Run episode
-        success, replay_images = run_episode(
+        log_message(f"Probing scene {episode_idx} (probe_trigger={cfg.probe_trigger}) ...", log_file)
+        metrics = run_episode(
             cfg,
             env,
             task_description,
             model,
             resize_size,
+            capture,
+            hook_groups,
             processor,
             action_head,
             proprio_projector,
@@ -590,119 +681,153 @@ def run_task(
             initial_state,
             log_file,
             episode_idx=episode_idx,
+            task_id=task_id,
+            env_trig=env_trig,
+            initial_state_trig=initial_state_trig,
         )
+        metrics["task"] = task_description
+        all_metrics.append(metrics)
 
-        # Update counters
-        task_episodes += 1
-        total_episodes += 1
-        if success:
-            task_successes += 1
-            total_successes += 1
+    return all_metrics
 
-        # Save replay video
-        save_rollout_video(
-            replay_images,
-            total_episodes,
-            success=success,
-            task_description=task_description,
-            log_file=log_file,
-            run_tag=cfg.eval_log_tag,
-        )
 
-        # Log results
-        log_message(f"Success: {success}", log_file)
-        log_message(f"# episodes completed so far: {total_episodes}", log_file)
-        log_message(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)", log_file)
-
-    # Log task results
-    task_success_rate = float(task_successes) / float(task_episodes) if task_episodes > 0 else 0
-    total_success_rate = float(total_successes) / float(total_episodes) if total_episodes > 0 else 0
-
-    log_message(f"Current task success rate: {task_success_rate}", log_file)
-    log_message(f"Current total success rate: {total_success_rate}", log_file)
-
-    # Log to wandb if enabled
-    if cfg.use_wandb:
-        wandb.log(
-            {
-                f"success_rate/{task_description}": task_success_rate,
-                f"num_episodes/{task_description}": task_episodes,
-            }
-        )
-
-    return total_episodes, total_successes
+def _aggregate(rows_per_scene):
+    """PROBE HELPER: mean L2/cosine across scenes, keyed by (layer, occurrence)."""
+    acc, order = {}, []
+    for rows in rows_per_scene:
+        for r in rows:
+            key = (r["layer"], r.get("occurrence"))
+            if key not in acc:
+                acc[key] = {"layer": r["layer"], "l2": [], "cosine_dist": []}
+                if "occurrence" in r:
+                    acc[key]["occurrence"] = r["occurrence"]
+                order.append(key)
+            acc[key]["l2"].append(r["l2"])
+            acc[key]["cosine_dist"].append(r["cosine_dist"])
+    out = []
+    for key in order:
+        a = acc[key]
+        row = {"layer": a["layer"], "l2": float(np.mean(a["l2"])),
+               "cosine_dist": float(np.mean(a["cosine_dist"]))}
+        if "occurrence" in a:
+            row["occurrence"] = a["occurrence"]
+        out.append(row)
+    return out
 
 
 @draccus.wrap()
 def eval_libero(cfg: GenerateConfig) -> float:
-    """Main function to evaluate a trained policy on LIBERO benchmark tasks."""
-    # Validate configuration
-    validate_config(cfg)
+    """Main entry: paired clean-vs-triggered activation probe."""
+    return run_single_probe(cfg)
 
-    # Set random seed
+
+def run_single_probe(cfg: GenerateConfig) -> float:
+    """Paired clean-vs-triggered activation probe over LIBERO tasks."""
+    validate_config(cfg)
+    tag = probe_output_tag(cfg)
+
     set_seed_everywhere(cfg.seed)
 
-    # Initialize model and components
     model, action_head, proprio_projector, noisy_action_projector, processor = initialize_model(cfg)
-
-    # Get expected image dimensions
     resize_size = get_image_resize_size(cfg)
 
-    # Setup logging
     log_file, local_log_filepath, run_id = setup_logging(cfg)
+    log_message(f"Probe tag:      {tag}", log_file)
+    out_txt = probe_output_path(tag)
+    log_message(f"Metrics table:  {out_txt}", log_file)
 
-    # Initialize LIBERO task suite
+    # Initialize LIBERO task suites (base = clean; physical suite for mug/stick)
     benchmark_dict = benchmark.get_benchmark_dict()
-    task_suite = benchmark_dict[cfg.task_suite_name]()
+    base_suite_name = cfg.task_suite_name
+    task_suite = benchmark_dict[base_suite_name]()
     num_tasks = task_suite.n_tasks
 
-    if cfg.trigger:
-        log_message(f"Task suite: {cfg.task_suite_name} (white pixel block trigger ON)", log_file)
+    task_suite_trig = None
+    if cfg.probe_trigger == "block":
+        log_message(
+            f"Paired probe: {base_suite_name} — clean vs white pixel block (same scene)",
+            log_file,
+        )
     else:
-        log_message(f"Task suite: {cfg.task_suite_name}", log_file)
-
-    # Start evaluation
-    total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks)):
-        total_episodes, total_successes = run_task(
-            cfg,
-            task_suite,
-            task_id,
-            model,
-            resize_size,
-            processor,
-            action_head,
-            proprio_projector,
-            noisy_action_projector,
-            total_episodes,
-            total_successes,
+        physical_suite_name = physical_trigger_suite_name(base_suite_name, cfg.probe_trigger)
+        task_suite_trig = benchmark_dict[physical_suite_name]()
+        log_message(
+            f"Paired probe: {base_suite_name} (clean) vs {physical_suite_name} "
+            f"({cfg.probe_trigger} in sim), same task_id + episode_idx",
             log_file,
         )
 
-    # Calculate final success rate
-    final_success_rate = float(total_successes) / float(total_episodes) if total_episodes > 0 else 0
+    # PROBE CHANGE: collect per-scene drift metrics across all tasks (was: a
+    # success/episode loop that returned a success rate).
+    capture = Capture()
+    hook_groups = register_all_probe_hooks(
+        model, capture,
+        proprio_projector=proprio_projector,
+        action_head=action_head,
+        noisy_action_projector=noisy_action_projector,
+    )
 
-    # Log final results
-    log_message("Final results:", log_file)
-    log_message(f"Total episodes: {total_episodes}", log_file)
-    log_message(f"Total successes: {total_successes}", log_file)
-    log_message(f"Overall success rate: {final_success_rate:.4f} ({final_success_rate * 100:.1f}%)", log_file)
+    all_metrics = []
+    set_probe_quiet(True)
+    try:
+        for task_id in tqdm.tqdm(range(num_tasks)):
+            run_task(
+                cfg,
+                task_suite,
+                task_id,
+                model,
+                resize_size,
+                processor,
+                action_head,
+                proprio_projector,
+                noisy_action_projector,
+                all_metrics,
+                log_file,
+                task_suite_trig=task_suite_trig,
+                capture=capture,
+                hook_groups=hook_groups,
+            )
+    finally:
+        hook_groups.remove()
+        set_probe_quiet(False)
 
-    # Log to wandb if enabled
-    if cfg.use_wandb:
-        wandb.log(
-            {
-                "success_rate/total": final_success_rate,
-                "num_episodes/total": total_episodes,
-            }
-        )
-        wandb.save(local_log_filepath)
+    # Aggregate (mean over scenes) and save JSON + a readable summary table.
+    keys = ("llm", "vision", "projector", "proprio", "action_head", "noisy_action")
+    agg = {k: _aggregate([m[k] for m in all_metrics]) for k in keys}
+    # DISABLED: 56-token LLM action-slot metrics
+    # if all_metrics and "llm_action_tokens" in all_metrics[0]:
+    #     agg["llm_action_tokens"] = _aggregate([m["llm_action_tokens"] for m in all_metrics])
+    agg["action"] = {
+        "l2_frobenius": float(np.mean([m["action"]["l2_frobenius"] for m in all_metrics])) if all_metrics else 0.0,
+        "cosine_dist": float(np.mean([m["action"]["cosine_dist"] for m in all_metrics])) if all_metrics else 0.0,
+        "js_divergence": None,
+    }
+
+    results = {
+        "within": agg,
+        "n_scenes": len(all_metrics),
+        "tag": tag,
+        "probe_trigger": cfg.probe_trigger,
+        "checkpoint": str(cfg.pretrained_checkpoint),
+        "task_suite": cfg.task_suite_name,
+    }
+    out_txt = probe_output_path(tag)
+    # JSON output disabled — summary .txt only
+    # save_log(results, path=out_json)
+    text = format_summary(results)
+    log_message("\n" + text, log_file)
+    print(text, flush=True)
+    with open(out_txt, "w") as f:
+        f.write(text + "\n")
+    _log(f"run_libero_probe  END  tag={tag}  scenes={len(all_metrics)}", force=True)
+    log_message(f"\nProbed {len(all_metrics)} scene(s) for {tag}.", log_file)
+    log_message(f"Saved table   -> {out_txt}", log_file)
 
     # Close log file
     if log_file:
         log_file.close()
 
-    return final_success_rate
+    return agg["action"]["l2_frobenius"]
 
 
 if __name__ == "__main__":
