@@ -309,6 +309,45 @@ def pool_tokens(arr):
     return a.reshape(-1)
 
 
+def token_l2_stats(hc, ht):
+    """Per-token L2 distance, no mean-pooling over the sequence axis.
+
+    Mean-pooling (pool_tokens) averages a trigger's effect on a handful of
+    tokens across the whole sequence, which can wash out a localized spike
+    (e.g. a single injected trigger token) in layers with long sequences.
+    Reporting max/p95 alongside the mean preserves that spike.
+    """
+    a = np.asarray(hc, dtype=np.float64)
+    b = np.asarray(ht, dtype=np.float64)
+    if a.ndim == 3:
+        a, b = a[0], b[0]
+    if a.ndim != 2 or a.shape != b.shape:
+        d = float(np.linalg.norm(a.reshape(-1) - b.reshape(-1)))
+        return {
+            "mean": d, "median": d, "max": d, "p95": d,
+            "max_token": None, "p95_token": None,
+            "max_above_median": 0.0, "p95_above_median": 0.0,
+        }
+    diffs = np.linalg.norm(a - b, axis=-1)  # (tokens,) per-token L2
+    median = float(np.median(diffs))
+    max_val = float(diffs.max())
+    max_idx = int(np.argmax(diffs))
+    sorted_idx = np.argsort(diffs)
+    p95_rank = min(int(np.ceil(0.95 * len(diffs))) - 1, len(diffs) - 1)
+    p95_idx = int(sorted_idx[p95_rank])
+    p95_val = float(diffs[p95_idx])
+    return {
+        "mean": float(diffs.mean()),
+        "median": median,
+        "max": max_val,
+        "p95": p95_val,
+        "max_token": max_idx,
+        "p95_token": p95_idx,
+        "max_above_median": max_val - median,
+        "p95_above_median": p95_val - median,
+    }
+
+
 def l2_distance(a, b):
     return float(np.linalg.norm(a - b))
 
@@ -362,8 +401,20 @@ def compute_layer_metrics(clean_store, trig_store, ordered_names, group: str = "
         for occ, (hc, ht) in enumerate(zip(clean_list, trig_list)):
             pc = pool_tokens(hc)
             pt = pool_tokens(ht)
-            row = {"layer": name, "l2": l2_distance(pc, pt),
-                   "cosine_dist": cosine_distance(pc, pt)}
+            tok = token_l2_stats(hc, ht)
+            row = {
+                "layer": name,
+                "l2": l2_distance(pc, pt),
+                "cosine_dist": cosine_distance(pc, pt),
+                "token_l2_mean": tok["mean"],
+                "token_l2_median": tok["median"],
+                "token_l2_max": tok["max"],
+                "token_l2_p95": tok["p95"],
+                "token_l2_max_token": tok["max_token"],
+                "token_l2_p95_token": tok["p95_token"],
+                "token_l2_max_above_median": tok["max_above_median"],
+                "token_l2_p95_above_median": tok["p95_above_median"],
+            }
             if len(clean_list) > 1:
                 row["occurrence"] = occ
             rows.append(row)
@@ -377,11 +428,20 @@ def compute_layer_metrics(clean_store, trig_store, ordered_names, group: str = "
             _log(f"  WARNING: {mismatched} layers had unequal firing counts")
         _log(f"  => computed {len(rows)} metric rows")
         if rows:
-            by_l2 = sorted(rows, key=lambda r: r["l2"], reverse=True)
-            _log(f"  top-3 {group} by L2 drift:")
-            for r in by_l2[:3]:
+            by_tok_max = sorted(rows, key=lambda r: r["token_l2_max"], reverse=True)
+            _log(f"  top-3 {group} by per-token L2 max:")
+            for r in by_tok_max[:3]:
                 occ = f" cam{r['occurrence']}" if "occurrence" in r else ""
-                _log(f"    {r['layer']}{occ}: L2={r['l2']:.4f}  cosine={r['cosine_dist']:.4f}")
+                max_tok = r.get("token_l2_max_token")
+                p95_tok = r.get("token_l2_p95_token")
+                max_tok_s = str(max_tok) if max_tok is not None else "N/A"
+                p95_tok_s = str(p95_tok) if p95_tok is not None else "N/A"
+                _log(f"    {r['layer']}{occ}: L2={r['l2']:.4f}  cosine={r['cosine_dist']:.4f}  "
+                     f"tok_mean={r['token_l2_mean']:.4f}  tok_med={r['token_l2_median']:.4f}  "
+                     f"tok_max={r['token_l2_max']:.4f}@{max_tok_s}  "
+                     f"(+med {r['token_l2_max_above_median']:.4f})  "
+                     f"tok_p95={r['token_l2_p95']:.4f}@{p95_tok_s}  "
+                     f"(+med {r['token_l2_p95_above_median']:.4f})")
     return rows
 
 
@@ -458,24 +518,68 @@ def _table_fmt_float(value):
     return f"{value:.4f}"
 
 
+def _table_fmt_token(value):
+    if value is None or value != value:
+        return "N/A"
+    return str(int(value))
+
+
 def _format_table(rows, title):
-    col_layer, col_l2, col_cos = "Layer", "L2 Distance", "Cosine Distance"
+    col_layer = "Layer"
+    col_l2 = "L2 (pooled)"
+    col_cos = "Cosine"
+    col_tok_mean = "Tok L2 mean"
+    col_tok_max = "Tok L2 max"
+    col_max_tok = "Max tok"
+    col_tok_p95 = "Tok L2 p95"
+    col_p95_tok = "P95 tok"
+    col_tok_med = "Tok L2 med"
+    col_max_dmed = "Max-med"
+    col_p95_dmed = "P95-med"
     labels = [_table_row_label(r) for r in rows]
     l2_vals = [_table_fmt_float(r["l2"]) for r in rows]
     cos_vals = [_table_fmt_float(r["cosine_dist"]) for r in rows]
+    tok_mean_vals = [_table_fmt_float(r.get("token_l2_mean", float("nan"))) for r in rows]
+    tok_med_vals = [_table_fmt_float(r.get("token_l2_median", float("nan"))) for r in rows]
+    tok_max_vals = [_table_fmt_float(r.get("token_l2_max", float("nan"))) for r in rows]
+    max_tok_vals = [_table_fmt_token(r.get("token_l2_max_token")) for r in rows]
+    max_dmed_vals = [_table_fmt_float(r.get("token_l2_max_above_median", float("nan"))) for r in rows]
+    tok_p95_vals = [_table_fmt_float(r.get("token_l2_p95", float("nan"))) for r in rows]
+    p95_tok_vals = [_table_fmt_token(r.get("token_l2_p95_token")) for r in rows]
+    p95_dmed_vals = [_table_fmt_float(r.get("token_l2_p95_above_median", float("nan"))) for r in rows]
 
     w_layer = max(len(col_layer), max((len(l) for l in labels), default=0))
     w_l2 = max(len(col_l2), max((len(v) for v in l2_vals), default=0))
     w_cos = max(len(col_cos), max((len(v) for v in cos_vals), default=0))
+    w_tok_mean = max(len(col_tok_mean), max((len(v) for v in tok_mean_vals), default=0))
+    w_tok_med = max(len(col_tok_med), max((len(v) for v in tok_med_vals), default=0))
+    w_tok_max = max(len(col_tok_max), max((len(v) for v in tok_max_vals), default=0))
+    w_max_tok = max(len(col_max_tok), max((len(v) for v in max_tok_vals), default=0))
+    w_max_dmed = max(len(col_max_dmed), max((len(v) for v in max_dmed_vals), default=0))
+    w_tok_p95 = max(len(col_tok_p95), max((len(v) for v in tok_p95_vals), default=0))
+    w_p95_tok = max(len(col_p95_tok), max((len(v) for v in p95_tok_vals), default=0))
+    w_p95_dmed = max(len(col_p95_dmed), max((len(v) for v in p95_dmed_vals), default=0))
 
-    sep = f"{'-' * w_layer}-+-{'-' * w_l2}-+-{'-' * w_cos}"
+    sep = (f"{'-' * w_layer}-+-{'-' * w_l2}-+-{'-' * w_cos}-+-{'-' * w_tok_mean}-+-"
+           f"{'-' * w_tok_med}-+-{'-' * w_tok_max}-+-{'-' * w_max_tok}-+-{'-' * w_max_dmed}-+-"
+           f"{'-' * w_tok_p95}-+-{'-' * w_p95_tok}-+-{'-' * w_p95_dmed}")
     lines = [
         title,
-        f"{col_layer:<{w_layer}} | {col_l2:>{w_l2}} | {col_cos:>{w_cos}}",
+        (f"{col_layer:<{w_layer}} | {col_l2:>{w_l2}} | {col_cos:>{w_cos}} | "
+         f"{col_tok_mean:>{w_tok_mean}} | {col_tok_med:>{w_tok_med}} | "
+         f"{col_tok_max:>{w_tok_max}} | {col_max_tok:>{w_max_tok}} | {col_max_dmed:>{w_max_dmed}} | "
+         f"{col_tok_p95:>{w_tok_p95}} | {col_p95_tok:>{w_p95_tok}} | {col_p95_dmed:>{w_p95_dmed}}"),
         sep,
     ]
-    for label, l2, cos in zip(labels, l2_vals, cos_vals):
-        lines.append(f"{label:<{w_layer}} | {l2:>{w_l2}} | {cos:>{w_cos}}")
+    for label, l2, cos, t_mean, t_med, t_max, max_tok, max_dm, t_p95, p95_tok, p95_dm in zip(
+            labels, l2_vals, cos_vals, tok_mean_vals, tok_med_vals, tok_max_vals, max_tok_vals,
+            max_dmed_vals, tok_p95_vals, p95_tok_vals, p95_dmed_vals):
+        lines.append(
+            f"{label:<{w_layer}} | {l2:>{w_l2}} | {cos:>{w_cos}} | "
+            f"{t_mean:>{w_tok_mean}} | {t_med:>{w_tok_med}} | "
+            f"{t_max:>{w_tok_max}} | {max_tok:>{w_max_tok}} | {max_dm:>{w_max_dmed}} | "
+            f"{t_p95:>{w_tok_p95}} | {p95_tok:>{w_p95_tok}} | {p95_dm:>{w_p95_dmed}}"
+        )
     return lines
 
 

@@ -692,23 +692,56 @@ def run_task(
 
 
 def _aggregate(rows_per_scene):
-    """PROBE HELPER: mean L2/cosine across scenes, keyed by (layer, occurrence)."""
+    """PROBE HELPER: mean L2/cosine/token-L2 across scenes, keyed by (layer, occurrence)."""
     acc, order = {}, []
     for rows in rows_per_scene:
         for r in rows:
             key = (r["layer"], r.get("occurrence"))
             if key not in acc:
-                acc[key] = {"layer": r["layer"], "l2": [], "cosine_dist": []}
+                acc[key] = {
+                    "layer": r["layer"],
+                    "l2": [],
+                    "cosine_dist": [],
+                    "token_l2_mean": [],
+                    "token_l2_median": [],
+                    "token_l2_max": [],
+                    "token_l2_p95": [],
+                    "token_l2_max_token": [],
+                    "token_l2_p95_token": [],
+                    "token_l2_max_above_median": [],
+                    "token_l2_p95_above_median": [],
+                }
                 if "occurrence" in r:
                     acc[key]["occurrence"] = r["occurrence"]
                 order.append(key)
             acc[key]["l2"].append(r["l2"])
             acc[key]["cosine_dist"].append(r["cosine_dist"])
+            acc[key]["token_l2_mean"].append(r.get("token_l2_mean", float("nan")))
+            acc[key]["token_l2_median"].append(r.get("token_l2_median", float("nan")))
+            acc[key]["token_l2_max"].append(r.get("token_l2_max", float("nan")))
+            acc[key]["token_l2_p95"].append(r.get("token_l2_p95", float("nan")))
+            acc[key]["token_l2_max_token"].append(r.get("token_l2_max_token"))
+            acc[key]["token_l2_p95_token"].append(r.get("token_l2_p95_token"))
+            acc[key]["token_l2_max_above_median"].append(r.get("token_l2_max_above_median", float("nan")))
+            acc[key]["token_l2_p95_above_median"].append(r.get("token_l2_p95_above_median", float("nan")))
     out = []
     for key in order:
         a = acc[key]
-        row = {"layer": a["layer"], "l2": float(np.mean(a["l2"])),
-               "cosine_dist": float(np.mean(a["cosine_dist"]))}
+        max_tok_vals = [v for v in a["token_l2_max_token"] if v is not None]
+        p95_tok_vals = [v for v in a["token_l2_p95_token"] if v is not None]
+        row = {
+            "layer": a["layer"],
+            "l2": float(np.mean(a["l2"])),
+            "cosine_dist": float(np.mean(a["cosine_dist"])),
+            "token_l2_mean": float(np.nanmean(a["token_l2_mean"])),
+            "token_l2_median": float(np.nanmean(a["token_l2_median"])),
+            "token_l2_max": float(np.nanmean(a["token_l2_max"])),
+            "token_l2_p95": float(np.nanmean(a["token_l2_p95"])),
+            "token_l2_max_token": int(round(np.mean(max_tok_vals))) if max_tok_vals else None,
+            "token_l2_p95_token": int(round(np.mean(p95_tok_vals))) if p95_tok_vals else None,
+            "token_l2_max_above_median": float(np.nanmean(a["token_l2_max_above_median"])),
+            "token_l2_p95_above_median": float(np.nanmean(a["token_l2_p95_above_median"])),
+        }
         if "occurrence" in a:
             row["occurrence"] = a["occurrence"]
         out.append(row)
