@@ -23,6 +23,7 @@ experiments/robot/libero/experiments/logs/
 **/*.mp4
 
 # Probe / trial_error generated outputs (keep .py scripts only)
+trial_error/probe_logs/
 trial_error/*.log
 trial_error/*_log.json
 trial_error/*_log.txt

@@ -117,6 +117,8 @@ from trial_error.paired_probe import (
     _log,
     register_all_probe_hooks,
     compute_all_probe_metrics,
+    extract_pooled_by_group,
+    compute_mahalanobis_by_group,
     format_summary,
     set_probe_quiet,
 )
@@ -202,9 +204,9 @@ def probe_output_tag(cfg: "GenerateConfig") -> str:
 
 
 def probe_output_path(tag: str) -> Path:
-    """Tagged summary table: probe_logs/run_libero_probe_log_goal_block.txt"""
+    """Tagged summary table: probe_logs/run_libero_probe_log_goal_block_2026_07_01-16_05_30.txt"""
     PROBE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    return PROBE_OUTPUT_DIR / f"run_libero_probe_log_{tag}.txt"
+    return PROBE_OUTPUT_DIR / f"run_libero_probe_log_{tag}_{DATE_TIME}.txt"
 
 # Set up logging
 logging.basicConfig(
@@ -245,7 +247,7 @@ class GenerateConfig:
     #################################################################################################################
     task_suite_name: str = TaskSuite.LIBERO_SPATIAL  # Task suite
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize in sim
-    num_trials_per_task: int = 50  # Number of rollouts per task
+    num_trials_per_task: int = 6  # Match SR eval (6 init states / episodes per task)
     initial_states_path: str = "DEFAULT"  # "DEFAULT", or path to initial states JSON file
     env_img_res: int = 256  # Resolution for environment images (not policy input resolution)
 
@@ -267,6 +269,12 @@ class GenerateConfig:
     #   mug   — libero_* vs libero_*_with_mug; same task_id + episode_idx (mug in sim)
     #   stick — libero_* vs libero_*_with_red_stick
     probe_trigger: str = "block"
+
+    # Fraction of clean scenes used to calibrate Mahalanobis mu/sigma.
+    # The remaining (1 - cal_fraction) clean scenes + all triggered scenes
+    # are scored on the held-out split to compute AUROC.
+    # Set to 0.0 to skip Mahalanobis entirely (faster runs).
+    cal_fraction: float = 0.5
 
     # fmt: on
 
@@ -365,7 +373,9 @@ def check_unnorm_key(cfg: GenerateConfig, model) -> None:
 def setup_logging(cfg: GenerateConfig):
     """Set up logging to file and optionally to wandb."""
     if cfg.eval_log_tag:
-        run_id = f"EVAL-{cfg.eval_log_tag}"
+        run_id = f"EVAL-{cfg.eval_log_tag}-{DATE_TIME}"
+        if cfg.run_id_note is not None:
+            run_id += f"--{cfg.run_id_note}"
     else:
         run_id = f"EVAL-{cfg.task_suite_name}-{cfg.model_family}-{DATE_TIME}"
         if cfg.run_id_note is not None:
@@ -583,6 +593,13 @@ def run_episode(
     metrics["probe_trigger"] = cfg.probe_trigger
     metrics["episode_idx"] = episode_idx
     metrics["task_id"] = task_id
+
+    # Retain pooled per-layer vectors for the cross-scene Mahalanobis pass
+    # (run_single_probe accumulates these to fit clean mu/sigma). Only kept when
+    # calibration is enabled, since the vectors add up across scenes.
+    if cfg.cal_fraction > 0.0:
+        metrics["_pooled"] = extract_pooled_by_group(clean_store, trig_store, hook_groups)
+
     log_message(
         f"  action L2 = {metrics['action']['l2_frobenius']:.4f}  "
         f"cosine = {metrics['action']['cosine_dist']:.4f}",
@@ -648,8 +665,6 @@ def run_task(
     # PROBE CHANGE: each "episode" is now ONE paired (clean vs triggered) scene,
     # not a full rollout. We collect metrics instead of success/videos.
     for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
-        if episode_idx > 5:
-            break
         log_message(f"\nTask: {task_description}", log_file)
 
         initial_state = _resolve_initial_state(
@@ -692,7 +707,7 @@ def run_task(
 
 
 def _aggregate(rows_per_scene):
-    """PROBE HELPER: mean L2/cosine/token-L2 across scenes, keyed by (layer, occurrence)."""
+    """PROBE HELPER: mean pooled L2 / relative_l2 / cosine across scenes."""
     acc, order = {}, []
     for rows in rows_per_scene:
         for r in rows:
@@ -701,46 +716,23 @@ def _aggregate(rows_per_scene):
                 acc[key] = {
                     "layer": r["layer"],
                     "l2": [],
+                    "relative_l2": [],
                     "cosine_dist": [],
-                    "token_l2_mean": [],
-                    "token_l2_median": [],
-                    "token_l2_max": [],
-                    "token_l2_p95": [],
-                    "token_l2_max_token": [],
-                    "token_l2_p95_token": [],
-                    "token_l2_max_above_median": [],
-                    "token_l2_p95_above_median": [],
                 }
                 if "occurrence" in r:
                     acc[key]["occurrence"] = r["occurrence"]
                 order.append(key)
             acc[key]["l2"].append(r["l2"])
+            acc[key]["relative_l2"].append(r.get("relative_l2", float("nan")))
             acc[key]["cosine_dist"].append(r["cosine_dist"])
-            acc[key]["token_l2_mean"].append(r.get("token_l2_mean", float("nan")))
-            acc[key]["token_l2_median"].append(r.get("token_l2_median", float("nan")))
-            acc[key]["token_l2_max"].append(r.get("token_l2_max", float("nan")))
-            acc[key]["token_l2_p95"].append(r.get("token_l2_p95", float("nan")))
-            acc[key]["token_l2_max_token"].append(r.get("token_l2_max_token"))
-            acc[key]["token_l2_p95_token"].append(r.get("token_l2_p95_token"))
-            acc[key]["token_l2_max_above_median"].append(r.get("token_l2_max_above_median", float("nan")))
-            acc[key]["token_l2_p95_above_median"].append(r.get("token_l2_p95_above_median", float("nan")))
     out = []
     for key in order:
         a = acc[key]
-        max_tok_vals = [v for v in a["token_l2_max_token"] if v is not None]
-        p95_tok_vals = [v for v in a["token_l2_p95_token"] if v is not None]
         row = {
             "layer": a["layer"],
             "l2": float(np.mean(a["l2"])),
+            "relative_l2": float(np.nanmean(a["relative_l2"])),
             "cosine_dist": float(np.mean(a["cosine_dist"])),
-            "token_l2_mean": float(np.nanmean(a["token_l2_mean"])),
-            "token_l2_median": float(np.nanmean(a["token_l2_median"])),
-            "token_l2_max": float(np.nanmean(a["token_l2_max"])),
-            "token_l2_p95": float(np.nanmean(a["token_l2_p95"])),
-            "token_l2_max_token": int(round(np.mean(max_tok_vals))) if max_tok_vals else None,
-            "token_l2_p95_token": int(round(np.mean(p95_tok_vals))) if p95_tok_vals else None,
-            "token_l2_max_above_median": float(np.nanmean(a["token_l2_max_above_median"])),
-            "token_l2_p95_above_median": float(np.nanmean(a["token_l2_p95_above_median"])),
         }
         if "occurrence" in a:
             row["occurrence"] = a["occurrence"]
@@ -835,6 +827,52 @@ def run_single_probe(cfg: GenerateConfig) -> float:
         "cosine_dist": float(np.mean([m["action"]["cosine_dist"] for m in all_metrics])) if all_metrics else 0.0,
         "js_divergence": None,
     }
+
+    # ----------------------------------------------------------------
+    # Mahalanobis detection (clean-calibrated, trigger-agnostic)
+    # Requires at least 4 scenes total (so cal and test each have >= 2).
+    # Skipped if cal_fraction == 0 or too few scenes.
+    # ----------------------------------------------------------------
+    maha_by_group: dict = {}
+    if cfg.cal_fraction > 0.0 and len(all_metrics) >= 4 and all_metrics:
+        log_message(
+            f"Computing Mahalanobis (cal_fraction={cfg.cal_fraction}, "
+            f"n_scenes={len(all_metrics)})...",
+            log_file,
+        )
+        # Build per-group, per-layer lists of pooled vectors across scenes.
+        # clean_vecs[group][layer_label] = [vec_scene0, vec_scene1, ...]
+        clean_vecs: dict[str, dict[str, list]] = {}
+        trig_vecs:  dict[str, dict[str, list]] = {}
+        for m in all_metrics:
+            grp_data = m.get("_pooled")
+            if grp_data is None:
+                continue
+            for grp, layers in grp_data.items():
+                clean_vecs.setdefault(grp, {})
+                trig_vecs.setdefault(grp, {})
+                for lbl, (c_vec, t_vec) in layers.items():
+                    clean_vecs[grp].setdefault(lbl, []).append(c_vec)
+                    trig_vecs[grp].setdefault(lbl, []).append(t_vec)
+
+        for grp in clean_vecs:
+            if not clean_vecs[grp]:
+                continue
+            maha_by_group[grp] = compute_mahalanobis_by_group(
+                clean_vecs[grp], trig_vecs[grp],
+                cal_fraction=cfg.cal_fraction,
+                seed=cfg.seed,
+            )
+            auc = maha_by_group[grp].get("auroc", float("nan"))
+            log_message(f"  Maha [{grp:>15}] AUROC={auc:.4f}", log_file)
+    elif cfg.cal_fraction == 0.0:
+        log_message("Mahalanobis skipped (cal_fraction=0.0).", log_file)
+    else:
+        log_message(
+            f"Mahalanobis skipped: need >= 4 scenes, got {len(all_metrics)}.", log_file)
+
+    if maha_by_group:
+        agg["mahalanobis"] = maha_by_group
 
     results = {
         "within": agg,

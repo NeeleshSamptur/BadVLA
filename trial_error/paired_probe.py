@@ -241,7 +241,26 @@ def register_all_probe_hooks(
         groups.handles.append(layer.register_forward_hook(_make_hook(capture, name)))
         groups.llm_names.append(name)
         _log(f"  + HOOK  {name}  (module={layer.__class__.__name__})")
-    _log(f"  => LLM: {len(groups.llm_names)} decoder blocks hooked")
+
+        # Also hook the attention/MLP sub-modules directly, i.e. BEFORE their
+        # output is added back into the residual stream. The full decoder-layer
+        # output above is the *accumulated* hidden state, which lets a token
+        # that picked up a huge magnitude early (a "massive activation" /
+        # attention-sink token) keep re-appearing as a huge diff at every later
+        # layer even though nothing new is happening to it there -- the residual
+        # connection just carries it forward almost unchanged. Hooking the
+        # sub-module output isolates the actual LOCAL update each layer
+        # contributes, so depth-wise drift for ordinary tokens isn't drowned out
+        # by repeatedly re-observing the same frozen early-layer artifact.
+        if hasattr(layer, "self_attn"):
+            attn_name = f"{name}.self_attn"
+            groups.handles.append(layer.self_attn.register_forward_hook(_make_hook(capture, attn_name)))
+            groups.llm_names.append(attn_name)
+        if hasattr(layer, "mlp"):
+            mlp_name = f"{name}.mlp"
+            groups.handles.append(layer.mlp.register_forward_hook(_make_hook(capture, mlp_name)))
+            groups.llm_names.append(mlp_name)
+    _log(f"  => LLM: {len(groups.llm_names)} modules hooked (block + self_attn + mlp per layer)")
 
     # ----- 5. Action head (L1 regression MLP) -----
     _log("")
@@ -309,47 +328,20 @@ def pool_tokens(arr):
     return a.reshape(-1)
 
 
-def token_l2_stats(hc, ht):
-    """Per-token L2 distance, no mean-pooling over the sequence axis.
-
-    Mean-pooling (pool_tokens) averages a trigger's effect on a handful of
-    tokens across the whole sequence, which can wash out a localized spike
-    (e.g. a single injected trigger token) in layers with long sequences.
-    Reporting max/p95 alongside the mean preserves that spike.
-    """
-    a = np.asarray(hc, dtype=np.float64)
-    b = np.asarray(ht, dtype=np.float64)
-    if a.ndim == 3:
-        a, b = a[0], b[0]
-    if a.ndim != 2 or a.shape != b.shape:
-        d = float(np.linalg.norm(a.reshape(-1) - b.reshape(-1)))
-        return {
-            "mean": d, "median": d, "max": d, "p95": d,
-            "max_token": None, "p95_token": None,
-            "max_above_median": 0.0, "p95_above_median": 0.0,
-        }
-    diffs = np.linalg.norm(a - b, axis=-1)  # (tokens,) per-token L2
-    median = float(np.median(diffs))
-    max_val = float(diffs.max())
-    max_idx = int(np.argmax(diffs))
-    sorted_idx = np.argsort(diffs)
-    p95_rank = min(int(np.ceil(0.95 * len(diffs))) - 1, len(diffs) - 1)
-    p95_idx = int(sorted_idx[p95_rank])
-    p95_val = float(diffs[p95_idx])
-    return {
-        "mean": float(diffs.mean()),
-        "median": median,
-        "max": max_val,
-        "p95": p95_val,
-        "max_token": max_idx,
-        "p95_token": p95_idx,
-        "max_above_median": max_val - median,
-        "p95_above_median": p95_val - median,
-    }
-
-
 def l2_distance(a, b):
     return float(np.linalg.norm(a - b))
+
+
+def relative_l2(clean, trig, eps: float = 1e-8):
+    """Scale-invariant L2: ||trig - clean|| / ||clean||.
+
+    Raw L2 is dominated by each layer's activation magnitude, so it cannot be
+    compared across layers (e.g. action_head dwarfs vision). Dividing by the
+    clean activation norm makes the drift a *fraction* of the signal size, so
+    values are comparable layer-to-layer regardless of scale.
+    """
+    denom = float(np.linalg.norm(clean)) + eps
+    return float(np.linalg.norm(np.asarray(trig) - np.asarray(clean)) / denom)
 
 
 def cosine_distance(a, b):
@@ -401,19 +393,11 @@ def compute_layer_metrics(clean_store, trig_store, ordered_names, group: str = "
         for occ, (hc, ht) in enumerate(zip(clean_list, trig_list)):
             pc = pool_tokens(hc)
             pt = pool_tokens(ht)
-            tok = token_l2_stats(hc, ht)
             row = {
                 "layer": name,
                 "l2": l2_distance(pc, pt),
+                "relative_l2": relative_l2(pc, pt),
                 "cosine_dist": cosine_distance(pc, pt),
-                "token_l2_mean": tok["mean"],
-                "token_l2_median": tok["median"],
-                "token_l2_max": tok["max"],
-                "token_l2_p95": tok["p95"],
-                "token_l2_max_token": tok["max_token"],
-                "token_l2_p95_token": tok["p95_token"],
-                "token_l2_max_above_median": tok["max_above_median"],
-                "token_l2_p95_above_median": tok["p95_above_median"],
             }
             if len(clean_list) > 1:
                 row["occurrence"] = occ
@@ -428,20 +412,12 @@ def compute_layer_metrics(clean_store, trig_store, ordered_names, group: str = "
             _log(f"  WARNING: {mismatched} layers had unequal firing counts")
         _log(f"  => computed {len(rows)} metric rows")
         if rows:
-            by_tok_max = sorted(rows, key=lambda r: r["token_l2_max"], reverse=True)
-            _log(f"  top-3 {group} by per-token L2 max:")
-            for r in by_tok_max[:3]:
+            by_l2 = sorted(rows, key=lambda r: r["l2"], reverse=True)
+            _log(f"  top-3 {group} by pooled L2:")
+            for r in by_l2[:3]:
                 occ = f" cam{r['occurrence']}" if "occurrence" in r else ""
-                max_tok = r.get("token_l2_max_token")
-                p95_tok = r.get("token_l2_p95_token")
-                max_tok_s = str(max_tok) if max_tok is not None else "N/A"
-                p95_tok_s = str(p95_tok) if p95_tok is not None else "N/A"
-                _log(f"    {r['layer']}{occ}: L2={r['l2']:.4f}  cosine={r['cosine_dist']:.4f}  "
-                     f"tok_mean={r['token_l2_mean']:.4f}  tok_med={r['token_l2_median']:.4f}  "
-                     f"tok_max={r['token_l2_max']:.4f}@{max_tok_s}  "
-                     f"(+med {r['token_l2_max_above_median']:.4f})  "
-                     f"tok_p95={r['token_l2_p95']:.4f}@{p95_tok_s}  "
-                     f"(+med {r['token_l2_p95_above_median']:.4f})")
+                _log(f"    {r['layer']}{occ}: L2={r['l2']:.4f}  "
+                     f"rel_L2={r['relative_l2']:.4f}  cosine={r['cosine_dist']:.4f}")
     return rows
 
 
@@ -501,6 +477,176 @@ def compute_all_probe_metrics(clean_store, trig_store, hook_groups: ProbeHookGro
 
 
 # ======================================================================
+# 2b. Mahalanobis detection (clean-calibrated, trigger-agnostic)
+# ======================================================================
+#
+# Idea: model what CLEAN activations look like (per-dimension mean/std from a
+# held-out calibration split of clean scenes), then score any activation by how
+# far off that clean manifold it sits. This is trigger-agnostic by construction
+# -- calibration never sees a trigger. Diagonal (per-dimension) Mahalanobis:
+#
+#     z          = (x - mu) / sigma          (per-dimension standardization)
+#     maha(x)    = || z ||_2                 (diagonal Mahalanobis distance)
+#
+# A clean test sample should score low; a triggered sample should score high if
+# the trigger pushes activations off the clean manifold.
+
+_GROUP_TO_NAMES_ATTR = {
+    "vision": "vision_names",
+    "projector": "projector_names",
+    "proprio": "proprio_names",
+    "action_head": "action_head_names",
+    "noisy_action": "noisy_action_names",
+    "llm": "llm_names",
+}
+
+
+def extract_pooled_by_group(clean_store, trig_store, hook_groups):
+    """Pool each hooked layer to a 1-D vector for ONE scene, grouped by component.
+
+    Returns {group: {layer_label: (clean_vec, trig_vec)}} where layer_label is
+    the layer name, plus a ``#<occ>`` suffix when a hook fires more than once
+    (e.g. vision blocks fire once per camera). Vectors are float32 to keep the
+    cross-scene accumulation (used later for Mahalanobis) memory-light.
+    """
+    out: dict[str, dict[str, tuple]] = {}
+    for group, attr in _GROUP_TO_NAMES_ATTR.items():
+        names = getattr(hook_groups, attr, [])
+        group_d: dict[str, tuple] = {}
+        for name in names:
+            clean_list = clean_store.get(name, [])
+            trig_list = trig_store.get(name, [])
+            if not clean_list or not trig_list:
+                continue
+            n = min(len(clean_list), len(trig_list))
+            multi = n > 1
+            for occ in range(n):
+                pc = pool_tokens(clean_list[occ]).astype(np.float32)
+                pt = pool_tokens(trig_list[occ]).astype(np.float32)
+                label = f"{name}#{occ}" if multi else name
+                group_d[label] = (pc, pt)
+        if group_d:
+            out[group] = group_d
+    return out
+
+
+def auroc(scores_pos, scores_neg):
+    """AUROC: can scores_pos (e.g. triggered) be ranked above scores_neg (clean)?
+
+    Same as t2i ``sklearn.metrics.roc_auc_score``: label 1 = pos, 0 = neg.
+    """
+    from sklearn.metrics import roc_auc_score
+
+    scores_pos = np.asarray(scores_pos, dtype=np.float64)
+    scores_neg = np.asarray(scores_neg, dtype=np.float64)
+    if len(scores_pos) == 0 or len(scores_neg) == 0:
+        return float("nan")
+    labels = np.concatenate([
+        np.ones(len(scores_pos), dtype=np.int32),
+        np.zeros(len(scores_neg), dtype=np.int32),
+    ])
+    scores = np.concatenate([scores_pos, scores_neg])
+    return float(roc_auc_score(labels, scores))
+
+
+def _split_indices(n, cal_fraction, seed):
+    """Shuffle scene indices and split into (calibration, test)."""
+    rng = np.random.default_rng(seed)
+    idx = rng.permutation(n)
+    n_cal = int(round(n * cal_fraction))
+    n_cal = max(1, min(n - 1, n_cal))  # keep at least 1 in each split
+    return idx[:n_cal], idx[n_cal:]
+
+
+def compute_mahalanobis_by_group(clean_by_layer, trig_by_layer,
+                                 cal_fraction: float = 0.5, seed: int = 0,
+                                 eps: float = 1e-6):
+    """Per-layer diagonal Mahalanobis + a group-level detection AUROC.
+
+    Parameters
+    ----------
+    clean_by_layer : {layer_label: [vec_scene0, vec_scene1, ...]}  (clean run)
+    trig_by_layer  : {layer_label: [vec_scene0, vec_scene1, ...]}  (triggered run)
+        Both keyed identically; index = scene order.
+    cal_fraction   : fraction of clean scenes used to fit mu/sigma (rest are test)
+    seed           : RNG seed for the calibration/test scene split
+
+    Returns
+    -------
+    dict with:
+      "rows"  : [{layer, maha_clean, maha_trig, maha_delta}, ...]
+      "auroc" : group-level AUROC of held-out clean (label 0) vs triggered
+                (label 1) using the summed diagonal Mahalanobis across layers.
+      "n_cal", "n_test"
+    """
+    labels = list(clean_by_layer.keys())
+    if not labels:
+        return {"rows": [], "auroc": float("nan"), "n_cal": 0, "n_test": 0}
+
+    n = max(len(v) for v in clean_by_layer.values())
+    if n < 2:
+        return {"rows": [], "auroc": float("nan"), "n_cal": 0, "n_test": n}
+
+    cal_idx, test_idx = _split_indices(n, cal_fraction, seed)
+
+    rows = []
+    # Accumulate summed squared-z per test scene for the group-level AUROC.
+    sq_clean = np.zeros(len(test_idx), dtype=np.float64)
+    sq_trig = np.zeros(len(test_idx), dtype=np.float64)
+
+    for label in labels:
+        C = np.stack(clean_by_layer[label]).astype(np.float64)  # (n, D)
+        T = np.stack(trig_by_layer[label]).astype(np.float64)   # (n, D)
+        if len(C) != n or len(T) != n:
+            continue  # inconsistent firing count; skip for clean alignment
+
+        mu = C[cal_idx].mean(axis=0)
+        raw_sigma = C[cal_idx].std(axis=0)
+        # Per-dimension variance floor. A fixed eps (1e-6) divides tiny drifts on
+        # near-constant dims by ~0 and blows Mahalanobis up to millions (e.g. the
+        # action-head ResNet blocks, which are nearly deterministic across clean
+        # scenes). The floor only ever affects dims whose real std is below it;
+        # dims with genuine variance keep their own std unchanged.
+        #
+        # Scale the floor by the layer's OWN typical variability: the median of
+        # the non-zero per-dim stds. This is data-driven for any layer that has
+        # real variance somewhere. Only when a layer is *fully* deterministic
+        # (no dim varies -> median undefined) do we fall back to the signal
+        # magnitude (RMS of the clean mean), since there is then no variance to
+        # borrow a scale from. Fit uses clean calibration only (trigger-agnostic).
+        nonzero = raw_sigma[raw_sigma > eps]
+        if nonzero.size > 0:
+            scale = float(np.median(nonzero))
+        else:
+            scale = float(np.sqrt(np.mean(mu ** 2)))  # fully-deterministic fallback
+        sigma_floor = max(eps, 1e-2 * scale)
+        sigma = np.maximum(raw_sigma, sigma_floor)
+
+        zc = (C[test_idx] - mu) / sigma  # (n_test, D)
+        zt = (T[test_idx] - mu) / sigma
+        maha_clean = np.linalg.norm(zc, axis=1)  # (n_test,)
+        maha_trig = np.linalg.norm(zt, axis=1)
+
+        sq_clean += (zc ** 2).sum(axis=1)
+        sq_trig += (zt ** 2).sum(axis=1)
+
+        rows.append({
+            "layer": label,
+            "maha_clean": float(maha_clean.mean()),
+            "maha_trig": float(maha_trig.mean()),
+            "maha_delta": float(maha_trig.mean() - maha_clean.mean()),
+        })
+
+    group_auroc = auroc(np.sqrt(sq_trig), np.sqrt(sq_clean))
+    return {
+        "rows": rows,
+        "auroc": group_auroc,
+        "n_cal": len(cal_idx),
+        "n_test": len(test_idx),
+    }
+
+
+# ======================================================================
 # 3. Reporting
 # ======================================================================
 
@@ -518,68 +664,70 @@ def _table_fmt_float(value):
     return f"{value:.4f}"
 
 
-def _table_fmt_token(value):
-    if value is None or value != value:
-        return "N/A"
-    return str(int(value))
-
-
 def _format_table(rows, title):
+    """Layer drift table: pooled L2 / Rel L2 / cosine."""
     col_layer = "Layer"
     col_l2 = "L2 (pooled)"
+    col_rel = "Rel L2"
     col_cos = "Cosine"
-    col_tok_mean = "Tok L2 mean"
-    col_tok_max = "Tok L2 max"
-    col_max_tok = "Max tok"
-    col_tok_p95 = "Tok L2 p95"
-    col_p95_tok = "P95 tok"
-    col_tok_med = "Tok L2 med"
-    col_max_dmed = "Max-med"
-    col_p95_dmed = "P95-med"
     labels = [_table_row_label(r) for r in rows]
     l2_vals = [_table_fmt_float(r["l2"]) for r in rows]
+    rel_vals = [_table_fmt_float(r.get("relative_l2", float("nan"))) for r in rows]
     cos_vals = [_table_fmt_float(r["cosine_dist"]) for r in rows]
-    tok_mean_vals = [_table_fmt_float(r.get("token_l2_mean", float("nan"))) for r in rows]
-    tok_med_vals = [_table_fmt_float(r.get("token_l2_median", float("nan"))) for r in rows]
-    tok_max_vals = [_table_fmt_float(r.get("token_l2_max", float("nan"))) for r in rows]
-    max_tok_vals = [_table_fmt_token(r.get("token_l2_max_token")) for r in rows]
-    max_dmed_vals = [_table_fmt_float(r.get("token_l2_max_above_median", float("nan"))) for r in rows]
-    tok_p95_vals = [_table_fmt_float(r.get("token_l2_p95", float("nan"))) for r in rows]
-    p95_tok_vals = [_table_fmt_token(r.get("token_l2_p95_token")) for r in rows]
-    p95_dmed_vals = [_table_fmt_float(r.get("token_l2_p95_above_median", float("nan"))) for r in rows]
 
     w_layer = max(len(col_layer), max((len(l) for l in labels), default=0))
     w_l2 = max(len(col_l2), max((len(v) for v in l2_vals), default=0))
+    w_rel = max(len(col_rel), max((len(v) for v in rel_vals), default=0))
     w_cos = max(len(col_cos), max((len(v) for v in cos_vals), default=0))
-    w_tok_mean = max(len(col_tok_mean), max((len(v) for v in tok_mean_vals), default=0))
-    w_tok_med = max(len(col_tok_med), max((len(v) for v in tok_med_vals), default=0))
-    w_tok_max = max(len(col_tok_max), max((len(v) for v in tok_max_vals), default=0))
-    w_max_tok = max(len(col_max_tok), max((len(v) for v in max_tok_vals), default=0))
-    w_max_dmed = max(len(col_max_dmed), max((len(v) for v in max_dmed_vals), default=0))
-    w_tok_p95 = max(len(col_tok_p95), max((len(v) for v in tok_p95_vals), default=0))
-    w_p95_tok = max(len(col_p95_tok), max((len(v) for v in p95_tok_vals), default=0))
-    w_p95_dmed = max(len(col_p95_dmed), max((len(v) for v in p95_dmed_vals), default=0))
 
-    sep = (f"{'-' * w_layer}-+-{'-' * w_l2}-+-{'-' * w_cos}-+-{'-' * w_tok_mean}-+-"
-           f"{'-' * w_tok_med}-+-{'-' * w_tok_max}-+-{'-' * w_max_tok}-+-{'-' * w_max_dmed}-+-"
-           f"{'-' * w_tok_p95}-+-{'-' * w_p95_tok}-+-{'-' * w_p95_dmed}")
+    sep = f"{'-' * w_layer}-+-{'-' * w_l2}-+-{'-' * w_rel}-+-{'-' * w_cos}"
     lines = [
         title,
-        (f"{col_layer:<{w_layer}} | {col_l2:>{w_l2}} | {col_cos:>{w_cos}} | "
-         f"{col_tok_mean:>{w_tok_mean}} | {col_tok_med:>{w_tok_med}} | "
-         f"{col_tok_max:>{w_tok_max}} | {col_max_tok:>{w_max_tok}} | {col_max_dmed:>{w_max_dmed}} | "
-         f"{col_tok_p95:>{w_tok_p95}} | {col_p95_tok:>{w_p95_tok}} | {col_p95_dmed:>{w_p95_dmed}}"),
+        (f"{col_layer:<{w_layer}} | {col_l2:>{w_l2}} | {col_rel:>{w_rel}} | "
+         f"{col_cos:>{w_cos}}"),
         sep,
     ]
-    for label, l2, cos, t_mean, t_med, t_max, max_tok, max_dm, t_p95, p95_tok, p95_dm in zip(
-            labels, l2_vals, cos_vals, tok_mean_vals, tok_med_vals, tok_max_vals, max_tok_vals,
-            max_dmed_vals, tok_p95_vals, p95_tok_vals, p95_dmed_vals):
+    for label, l2, rel, cos in zip(labels, l2_vals, rel_vals, cos_vals):
         lines.append(
-            f"{label:<{w_layer}} | {l2:>{w_l2}} | {cos:>{w_cos}} | "
-            f"{t_mean:>{w_tok_mean}} | {t_med:>{w_tok_med}} | "
-            f"{t_max:>{w_tok_max}} | {max_tok:>{w_max_tok}} | {max_dm:>{w_max_dmed}} | "
-            f"{t_p95:>{w_tok_p95}} | {p95_tok:>{w_p95_tok}} | {p95_dm:>{w_p95_dmed}}"
+            f"{label:<{w_layer}} | {l2:>{w_l2}} | {rel:>{w_rel}} | {cos:>{w_cos}}"
         )
+    return lines
+
+
+def _format_maha_table(maha_result, title):
+    """Format a Mahalanobis result dict as a 4-column ASCII table."""
+    rows = maha_result.get("rows", [])
+    if not rows:
+        return [title, "  (no data)"]
+
+    col_layer = "Layer"
+    col_clean = "Maha(clean)"
+    col_trig  = "Maha(trig)"
+    col_delta = "Delta"
+
+    labels      = [r["layer"] for r in rows]
+    clean_vals  = [_table_fmt_float(r["maha_clean"]) for r in rows]
+    trig_vals   = [_table_fmt_float(r["maha_trig"])  for r in rows]
+    delta_vals  = [_table_fmt_float(r["maha_delta"]) for r in rows]
+
+    w_layer = max(len(col_layer), max((len(l) for l in labels), default=0))
+    w_cl    = max(len(col_clean), max((len(v) for v in clean_vals), default=0))
+    w_tr    = max(len(col_trig),  max((len(v) for v in trig_vals),  default=0))
+    w_de    = max(len(col_delta), max((len(v) for v in delta_vals), default=0))
+
+    sep = f"{'-'*w_layer}-+-{'-'*w_cl}-+-{'-'*w_tr}-+-{'-'*w_de}"
+    lines = [
+        title,
+        f"{col_layer:<{w_layer}} | {col_clean:>{w_cl}} | {col_trig:>{w_tr}} | {col_delta:>{w_de}}",
+        sep,
+    ]
+    for lab, cl, tr, de in zip(labels, clean_vals, trig_vals, delta_vals):
+        lines.append(f"{lab:<{w_layer}} | {cl:>{w_cl}} | {tr:>{w_tr}} | {de:>{w_de}}")
+
+    n_cal  = maha_result.get("n_cal", "?")
+    n_test = maha_result.get("n_test", "?")
+    auc    = maha_result.get("auroc", float("nan"))
+    lines.append(f"  cal={n_cal} test={n_test}  group-AUROC={_table_fmt_float(auc)}")
     return lines
 
 
@@ -617,4 +765,37 @@ def format_summary_section(metrics: dict):
         if metrics.get(key):
             lines.append("")
             lines.extend(_format_table(metrics[key], title))
+
+    # Mahalanobis section (only present when run with --cal_fraction > 0)
+    if metrics.get("mahalanobis"):
+        lines.append("")
+        lines.append("=== Mahalanobis Detection (diagonal, clean-calibrated) ===")
+        lines.append("  Drift tables above: pooled L2 / Rel L2 / cosine (mean over tokens).")
+        lines.append("  Mahalanobis uses pooled, clean-calibrated z-scores for detection AUROC.")
+        lines.append("  AUROC: P(Maha(trig) > Maha(clean)) on held-out test scenes.")
+        for grp_key, grp_title in (
+            ("llm",         "LLM decoder blocks:"),
+            ("projector",   "Projector layers:"),
+            ("proprio",     "Proprio projector:"),
+            ("action_head", "Action head layers:"),
+            ("vision",      "Vision ViT blocks:"),
+            ("noisy_action","Noisy action projector:"),
+        ):
+            maha = metrics["mahalanobis"].get(grp_key)
+            if maha and maha.get("rows"):
+                lines.append("")
+                lines.extend(_format_maha_table(maha, grp_title))
+        # Summary AUROC line across all groups
+        aurocs = {
+            g: metrics["mahalanobis"][g]["auroc"]
+            for g in metrics["mahalanobis"]
+            if metrics["mahalanobis"].get(g)
+            and metrics["mahalanobis"][g].get("auroc") == metrics["mahalanobis"][g].get("auroc")
+        }
+        if aurocs:
+            lines.append("")
+            lines.append("  Group-level detection AUROC summary:")
+            for g, auc in aurocs.items():
+                lines.append(f"    {g:<15}: {_table_fmt_float(auc)}")
+
     return "\n".join(lines)
