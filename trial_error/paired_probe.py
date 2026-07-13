@@ -483,10 +483,19 @@ def compute_all_probe_metrics(clean_store, trig_store, hook_groups: ProbeHookGro
 # Idea: model what CLEAN activations look like (per-dimension mean/std from a
 # held-out calibration split of clean scenes), then score any activation by how
 # far off that clean manifold it sits. This is trigger-agnostic by construction
-# -- calibration never sees a trigger. Diagonal (per-dimension) Mahalanobis:
+# -- calibration never sees a trigger. Diagonal Mahalanobis:
 #
 #     z          = (x - mu) / sigma          (per-dimension standardization)
 #     maha(x)    = || z ||_2                 (diagonal Mahalanobis distance)
+#
+# This is already scale-invariant to a layer's overall activation magnitude:
+# mu and sigma are fit from that same layer's raw units, so rescaling a whole
+# layer by any constant c rescales mu and sigma by c too and z is unchanged.
+# No extra normalization (e.g. L2-normalizing x first) is needed for that --
+# doing so would only discard magnitude information without adding invariance.
+# The one place scale-invariance can leak in is the variance floor below,
+# which is why it is defined relative to each layer's own scale rather than
+# as a fixed absolute number.
 #
 # A clean test sample should score low; a triggered sample should score high if
 # the trigger pushes activations off the clean manifold.
@@ -563,6 +572,15 @@ def compute_mahalanobis_by_group(clean_by_layer, trig_by_layer,
                                  eps: float = 1e-6):
     """Per-layer diagonal Mahalanobis + a group-level detection AUROC.
 
+    Operates on raw pooled activations (no upfront normalization). Diagonal
+    z-scoring, z = (x - mu) / sigma with mu/sigma fit on clean calibration in
+    that layer's own raw units, is already invariant to the layer's overall
+    activation magnitude: rescaling a layer's activations by any constant c
+    rescales mu and sigma by c too, so z is unchanged. See the module-level
+    comment above for the proof. The only place that invariance can leak is
+    the variance floor, which is therefore kept relative to the layer's own
+    scale (see below) instead of a fixed absolute constant.
+
     Parameters
     ----------
     clean_by_layer : {layer_label: [vec_scene0, vec_scene1, ...]}  (clean run)
@@ -595,31 +613,38 @@ def compute_mahalanobis_by_group(clean_by_layer, trig_by_layer,
     sq_trig = np.zeros(len(test_idx), dtype=np.float64)
 
     for label in labels:
-        C = np.stack(clean_by_layer[label]).astype(np.float64)  # (n, D)
-        T = np.stack(trig_by_layer[label]).astype(np.float64)   # (n, D)
+        C = np.stack(clean_by_layer[label]).astype(np.float64)  # (n, D), raw units
+        T = np.stack(trig_by_layer[label]).astype(np.float64)   # (n, D), raw units
         if len(C) != n or len(T) != n:
             continue  # inconsistent firing count; skip for clean alignment
 
         mu = C[cal_idx].mean(axis=0)
         raw_sigma = C[cal_idx].std(axis=0)
-        # Per-dimension variance floor. A fixed eps (1e-6) divides tiny drifts on
-        # near-constant dims by ~0 and blows Mahalanobis up to millions (e.g. the
-        # action-head ResNet blocks, which are nearly deterministic across clean
-        # scenes). The floor only ever affects dims whose real std is below it;
-        # dims with genuine variance keep their own std unchanged.
+        # Per-dimension variance floor, needed because near-constant dims (e.g.
+        # the action-head ResNet blocks, which are nearly deterministic across
+        # clean scenes) have raw_sigma ~ 0 and would blow z = (x-mu)/sigma up to
+        # huge values for any tiny drift. The floor only ever affects dims whose
+        # real std is below it; dims with genuine variance keep their own std.
         #
         # Scale the floor by the layer's OWN typical variability: the median of
         # the non-zero per-dim stds. This is data-driven for any layer that has
-        # real variance somewhere. Only when a layer is *fully* deterministic
-        # (no dim varies -> median undefined) do we fall back to the signal
-        # magnitude (RMS of the clean mean), since there is then no variance to
-        # borrow a scale from. Fit uses clean calibration only (trigger-agnostic).
+        # real variance somewhere, and -- critically -- scales linearly with
+        # that layer's own raw magnitude, so it does not break the scale-
+        # invariance of z (see module comment above): a layer with huge raw
+        # activations (action_head) and one with tiny raw activations (proprio)
+        # each get a floor sized to their own units, not a shared absolute one.
+        # Only when a layer is *fully* deterministic (no dim varies -> median
+        # undefined) do we fall back to the signal magnitude (RMS of the clean
+        # mean), since there is then no variance to borrow a scale from. `eps`
+        # is used only as a literal division-by-zero guard for the fully-zero
+        # edge case, never as the dominant floor. Fit uses clean calibration
+        # only (trigger-agnostic).
         nonzero = raw_sigma[raw_sigma > eps]
         if nonzero.size > 0:
             scale = float(np.median(nonzero))
         else:
             scale = float(np.sqrt(np.mean(mu ** 2)))  # fully-deterministic fallback
-        sigma_floor = max(eps, 1e-2 * scale)
+        sigma_floor = max(1e-2 * scale, eps)
         sigma = np.maximum(raw_sigma, sigma_floor)
 
         zc = (C[test_idx] - mu) / sigma  # (n_test, D)
