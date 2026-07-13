@@ -653,8 +653,15 @@ def compute_mahalanobis_by_group(clean_by_layer, trig_by_layer,
 def _table_row_label(row):
     occ = f"#cam{row['occurrence']}" if "occurrence" in row else ""
     label = f"{row['layer']}{occ}"
+    # llm.layer_05 / llm.layer_05.self_attn / llm.layer_05.mlp
     if label.startswith("llm.layer_"):
-        return f"{int(label.split('_')[-1]):>2}"
+        rest = label[len("llm.layer_"):]
+        num, _, suffix = rest.partition(".")
+        try:
+            short = f"{int(num):>2}"
+        except ValueError:
+            return label
+        return f"{short}.{suffix}" if suffix else short
     return label
 
 
