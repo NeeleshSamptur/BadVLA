@@ -121,6 +121,12 @@ from trial_error.paired_probe import (
     compute_mahalanobis_by_group,
     format_summary,
     set_probe_quiet,
+    compute_ffn_preact_diffs,
+    aggregate_ffn_preact_diffs,
+    select_candidate_layers,
+    flag_candidate_neurons,
+    format_candidate_neurons_table,
+    label_candidate_neurons_with_tokens,
 )
 # ==============================================================================
 
@@ -203,6 +209,39 @@ def probe_output_tag(cfg: "GenerateConfig") -> str:
     return f"{suite}_{cfg.probe_trigger}"
 
 
+def _layer_num_from_ffn_preact_name(name: str) -> int:
+    """"llm.layer_05.mlp.preact" -> 5"""
+    rest = name[len("llm.layer_"):]
+    num, _, _ = rest.partition(".")
+    return int(num)
+
+
+def write_candidate_neurons_yaml(path: Path, candidate_rows, dict_name: str = "stage1_candidates") -> None:
+    """Write Stage 1/2's flagged+labeled (layer, neuron_idx) pairs as
+    {layer_num: [neuron_ids]}, the format expected by
+    mechanistic-steering-vlas's
+    src/libero_experiments/interventions.py::load_intervention_dict (Stage 3
+    ablation). Written by hand (no new PyYAML dependency) since the structure
+    is a simple int -> list-of-ints map. When Stage 2 has run, each neuron_id
+    gets a trailing YAML comment with its top logit-lens tokens -- ignored by
+    the YAML parser, useful for a human skimming the file.
+    """
+    by_layer: dict[int, list] = {}
+    for row in candidate_rows:
+        layer_num = _layer_num_from_ffn_preact_name(row["layer"])
+        by_layer.setdefault(layer_num, []).append(row)
+
+    lines = [f"{dict_name}:"]
+    for layer_num in sorted(by_layer):
+        lines.append(f"  {layer_num}:")
+        for row in sorted(by_layer[layer_num], key=lambda r: r["neuron_idx"]):
+            comment = ""
+            if row.get("top_tokens"):
+                comment = f"  # {', '.join(row['top_tokens'][:5])}"
+            lines.append(f"    - {row['neuron_idx']}{comment}")
+    path.write_text("\n".join(lines) + "\n")
+
+
 def probe_output_path(tag: str) -> Path:
     """Tagged summary table: probe_logs/run_libero_probe_log_goal_block_2026_07_01-16_05_30.txt"""
     PROBE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -276,6 +315,25 @@ class GenerateConfig:
     # Set to 0.0 to skip Mahalanobis entirely (faster runs).
     cal_fraction: float = 0.5
 
+    # Stage 1 backdoor-neuron forensics (see trial_error/backdoor_neuron_forensics_plan.md):
+    # adds a third (control-perturbation) forward pass per scene, hooks the
+    # FFN pre-down_proj activation on every LLM layer, and flags neurons that
+    # shift for the real trigger but not for the control. Only supported with
+    # probe_trigger=="block" (the control perturbation is an image patch, like
+    # the block trigger itself; mug/stick triggers are physical scene objects
+    # with no equivalent image-patch control).
+    stage1_forensics: bool = False
+    # How many top-divergent FFN layers (by whole-mlp relative_l2) to drill
+    # into for per-neuron flagging.
+    ffn_top_layers: int = 8
+    # A neuron is flagged only if |trig_diff| / (|control_diff| + eps) exceeds this.
+    ffn_ratio_thresh: float = 3.0
+    # Max neurons flagged per candidate layer.
+    ffn_top_k_neurons: int = 25
+    # Stage 2 (logit lens): top-k vocab tokens to label each flagged neuron
+    # with. Runs automatically whenever stage1_forensics flags >= 1 neuron.
+    stage2_top_k: int = 10
+
     # fmt: on
 
     trigger: bool = False
@@ -296,6 +354,12 @@ def validate_config(cfg: GenerateConfig) -> None:
     assert cfg.probe_trigger in ("block", "mug", "stick"), (
         f"probe_trigger must be block|mug|stick (got {cfg.probe_trigger!r})"
     )
+    if cfg.stage1_forensics and cfg.probe_trigger != "block":
+        raise ValueError(
+            "stage1_forensics currently requires probe_trigger=='block' "
+            "(the control perturbation is an image patch comparable to the "
+            "block trigger; mug/stick have no equivalent image-patch control)."
+        )
     cfg.task_suite_name = resolve_base_suite_name(cfg.task_suite_name)
     if cfg.probe_trigger == "block" and cfg.task_suite_name in PHYSICAL_TRIGGER_SUITES:
         raise ValueError(
@@ -477,6 +541,50 @@ def add_trigger_img(
     return trigger_image_primary
 
 
+def add_control_img(
+        image,
+        trigger_size=0.10,
+        trigger_position="center",
+        seed=0,
+):
+    """Benign perturbation, same patch geometry as add_trigger_img but NEVER
+    used as the real trigger (uniform random RGB noise instead of a flat
+    white block).
+
+    Stage 1 forensics (backdoor_neuron_forensics_plan.md) needs this to tell
+    apart "this neuron reacts to any unusual patch in this region" from
+    "this neuron reacts to the real trigger specifically": clean vs. real
+    trigger vs. this control get run through the same model and compared.
+    """
+    import copy
+    control_image = copy.deepcopy(image)
+    h, w = control_image.shape[:2]
+    trigger_size = int(min(h, w) * trigger_size)
+
+    if trigger_position == "center":
+        center_x, center_y = w // 2, h // 2
+    elif trigger_position == "top_left":
+        center_x, center_y = trigger_size // 2, trigger_size // 2
+    elif trigger_position == "top_right":
+        center_x, center_y = w - trigger_size // 2, trigger_size // 2
+    elif trigger_position == "bottom_left":
+        center_x, center_y = trigger_size // 2, h - trigger_size // 2
+    elif trigger_position == "bottom_right":
+        center_x, center_y = w - trigger_size // 2, h - trigger_size // 2
+
+    start_x = center_x - trigger_size // 2
+    end_x = center_x + trigger_size // 2
+    start_y = center_y - trigger_size // 2
+    end_y = center_y + trigger_size // 2
+
+    rng = np.random.default_rng(seed)
+    patch_shape = control_image[start_y:end_y, start_x:end_x].shape
+    control_image[start_y:end_y, start_x:end_x] = rng.integers(
+        0, 256, size=patch_shape, dtype=np.uint8)
+
+    return control_image
+
+
 def prepare_observation(obs, resize_size):
     """Prepare observation for policy input."""
     # Get preprocessed images
@@ -542,6 +650,7 @@ def run_episode(
 
     clean_observation = _warmup_and_prepare_observation(env, cfg, initial_state, resize_size)
 
+    control_obs = None
     if cfg.probe_trigger == "block":
         clean_obs = copy.deepcopy(clean_observation)
         trig_obs = copy.deepcopy(clean_observation)
@@ -549,6 +658,15 @@ def run_episode(
                                                  trigger_position="center", trigger_color=255)
         trig_obs["wrist_image"] = add_trigger_img(trig_obs["wrist_image"], trigger_size=0.10,
                                                   trigger_position="center", trigger_color=255)
+        if cfg.stage1_forensics:
+            control_obs = copy.deepcopy(clean_observation)
+            control_seed = (task_id or 0) * 1000 + (episode_idx or 0)
+            control_obs["full_image"] = add_control_img(
+                control_obs["full_image"], trigger_size=0.10,
+                trigger_position="center", seed=control_seed)
+            control_obs["wrist_image"] = add_control_img(
+                control_obs["wrist_image"], trigger_size=0.10,
+                trigger_position="center", seed=control_seed + 1)
     else:
         assert env_trig is not None, "env_trig required for mug/stick probe_trigger"
         trig_state = initial_state_trig if initial_state_trig is not None else initial_state
@@ -577,6 +695,18 @@ def run_episode(
     )
     trig_store = capture.snapshot()
 
+    control_store = None
+    if control_obs is not None:
+        capture.reset()
+        get_action(
+            cfg, model, control_obs, task_description,
+            processor=processor, action_head=action_head,
+            proprio_projector=proprio_projector,
+            noisy_action_projector=noisy_action_projector,
+            use_film=cfg.use_film,
+        )
+        control_store = capture.snapshot()
+
     # DISABLED: 56-token LLM action-slot slice (llm_action_tokens metrics)
     # action_token_slice = resolve_action_token_slice(
     #     model, cfg, processor, clean_obs, task_description,
@@ -599,6 +729,12 @@ def run_episode(
     # calibration is enabled, since the vectors add up across scenes.
     if cfg.cal_fraction > 0.0:
         metrics["_pooled"] = extract_pooled_by_group(clean_store, trig_store, hook_groups)
+
+    # Stage 1 forensics: per-scene FFN neuron diff vectors (trig-clean,
+    # control-clean), aggregated across scenes later in run_single_probe.
+    if cfg.stage1_forensics and control_store is not None:
+        metrics["_ffn_diffs"] = compute_ffn_preact_diffs(
+            clean_store, trig_store, control_store, hook_groups.ffn_preact_names)
 
     log_message(
         f"  action L2 = {metrics['action']['l2_frobenius']:.4f}  "
@@ -790,6 +926,7 @@ def run_single_probe(cfg: GenerateConfig) -> float:
         proprio_projector=proprio_projector,
         action_head=action_head,
         noisy_action_projector=noisy_action_projector,
+        hook_ffn_preact=cfg.stage1_forensics,
     )
 
     all_metrics = []
@@ -874,6 +1011,39 @@ def run_single_probe(cfg: GenerateConfig) -> float:
     if maha_by_group:
         agg["mahalanobis"] = maha_by_group
 
+    # ----------------------------------------------------------------
+    # Stage 1 forensics: differential FFN neuron flagging (real trigger vs.
+    # clean, with a control-perturbation vs. clean pass to rule out "any
+    # unusual patch" neurons). See backdoor_neuron_forensics_plan.md.
+    # ----------------------------------------------------------------
+    candidate_neuron_rows = []
+    candidate_layers = []
+    if cfg.stage1_forensics:
+        per_scene_diffs = [m["_ffn_diffs"] for m in all_metrics if m.get("_ffn_diffs")]
+        if per_scene_diffs:
+            agg_ffn_diffs = aggregate_ffn_preact_diffs(per_scene_diffs)
+            candidate_layers = select_candidate_layers(agg["llm"], top_n=cfg.ffn_top_layers)
+            candidate_neuron_rows = flag_candidate_neurons(
+                agg_ffn_diffs, candidate_layers,
+                top_k=cfg.ffn_top_k_neurons, ratio_thresh=cfg.ffn_ratio_thresh,
+            )
+            log_message(
+                f"Stage 1 forensics: {len(candidate_neuron_rows)} candidate neuron(s) "
+                f"flagged across {len(candidate_layers)} candidate layer(s) "
+                f"(ratio_thresh={cfg.ffn_ratio_thresh}).",
+                log_file,
+            )
+            if candidate_neuron_rows:
+                log_message(
+                    f"Stage 2 (logit lens): labeling {len(candidate_neuron_rows)} "
+                    f"flagged neuron(s) with top-{cfg.stage2_top_k} vocab tokens...",
+                    log_file,
+                )
+                candidate_neuron_rows = label_candidate_neurons_with_tokens(
+                    model, processor, candidate_neuron_rows, top_k=cfg.stage2_top_k)
+        else:
+            log_message("Stage 1 forensics: no per-scene FFN diffs collected.", log_file)
+
     results = {
         "within": agg,
         "n_scenes": len(all_metrics),
@@ -886,10 +1056,18 @@ def run_single_probe(cfg: GenerateConfig) -> float:
     # JSON output disabled — summary .txt only
     # save_log(results, path=out_json)
     text = format_summary(results)
+    if cfg.stage1_forensics:
+        text += "\n\n" + "\n".join(format_candidate_neurons_table(candidate_neuron_rows))
     log_message("\n" + text, log_file)
     print(text, flush=True)
     with open(out_txt, "w") as f:
         f.write(text + "\n")
+
+    if cfg.stage1_forensics and candidate_neuron_rows:
+        yaml_path = out_txt.with_name(f"candidate_neurons_{tag}_{DATE_TIME}.yaml")
+        write_candidate_neurons_yaml(yaml_path, candidate_neuron_rows, dict_name="stage1_candidates")
+        log_message(f"Saved candidate neurons -> {yaml_path}", log_file)
+
     _log(f"run_libero_probe  END  tag={tag}  scenes={len(all_metrics)}", force=True)
     log_message(f"\nProbed {len(all_metrics)} scene(s) for {tag}.", log_file)
     log_message(f"Saved table   -> {out_txt}", log_file)
