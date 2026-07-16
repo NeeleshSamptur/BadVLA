@@ -1286,3 +1286,93 @@ def format_summary_section(metrics: dict):
                 lines.append(f"    {g:<15}: {_table_fmt_float(auc)}")
 
     return "\n".join(lines)
+
+
+# ======================================================================
+# Classic logit lens -- project REAL activations (not fixed neuron
+# weights) through lm_head, clean vs triggered, per layer.
+# ======================================================================
+#
+# Unlike a neuron's fixed value vector (no input involved), this projects
+# the actual pooled hidden state from a real forward pass -- the classic
+# logit-lens technique. Question: does the model's "currently predicted
+# token" visibly diverge between clean and triggered inputs, and at which
+# layer does that divergence first appear?
+
+def logit_lens_activation_divergence(model, clean_store, trig_store, layer_names, top_k: int = 10):
+    """For each layer name (whole-block outputs, e.g. hook_groups.llm_names
+    entries like "llm.layer_05"), project the real pooled clean and
+    triggered hidden states through lm_head and compare top-k tokens.
+
+    Returns a list of {layer, clean_top_ids, trig_top_ids, overlap} rows,
+    where overlap = number of tokens shared between the two top-k lists
+    (top_k = identical top-k sets, 0 = completely disjoint).
+    """
+    lm_head_weight = model.language_model.lm_head.weight.detach()
+    device, dtype = lm_head_weight.device, torch.float32
+    embedding_matrix = lm_head_weight.to(dtype=dtype)
+
+    rows = []
+    with torch.no_grad():
+        for name in layer_names:
+            c = clean_store.get(name, [])
+            t = trig_store.get(name, [])
+            if not c or not t:
+                continue
+            pc = torch.tensor(pool_tokens(c[0]), dtype=dtype, device=device)
+            pt = torch.tensor(pool_tokens(t[0]), dtype=dtype, device=device)
+
+            clean_logits = pc @ embedding_matrix.T
+            trig_logits = pt @ embedding_matrix.T
+            clean_top = torch.topk(clean_logits, top_k).indices.tolist()
+            trig_top = torch.topk(trig_logits, top_k).indices.tolist()
+            overlap = len(set(clean_top) & set(trig_top))
+
+            rows.append({
+                "layer": name,
+                "clean_top_ids": clean_top,
+                "trig_top_ids": trig_top,
+                "overlap": overlap,
+                "top_k": top_k,
+            })
+    return rows
+
+
+def decode_token_ids(model, processor, token_ids, action_bins: int = 256,
+                     action_min: float = -1.0, action_max: float = 1.0):
+    """Decode a list of vocab token IDs to readable strings. Tokens in the
+    last `action_bins` vocab slots are repurposed action-value bins (a
+    holdover from base OpenVLA's discrete-token action scheme, unused by
+    OFT's real action head but still present in lm_head's weights) --
+    decode those back to the numeric action value instead of a raw token
+    string.
+    """
+    from prismatic.vla.action_tokenizer import ActionTokenizer
+
+    tokenizer = processor.tokenizer
+    vocab_size = tokenizer.vocab_size
+    action_token_start = vocab_size - action_bins
+    action_tokenizer = ActionTokenizer(
+        tokenizer, bins=action_bins, min_action=action_min, max_action=action_max)
+
+    strs = []
+    for tid in token_ids:
+        if tid >= action_token_start:
+            action_val = action_tokenizer.decode_token_ids_to_actions(np.array([tid]))[0]
+            strs.append(f"[action: {action_val:.3f}]")
+        else:
+            strs.append(repr(tokenizer.decode([tid])))
+    return strs
+
+
+def format_logit_lens_divergence_table(rows, title="Classic logit lens: clean vs. triggered (real activations)"):
+    if not rows:
+        return [title, "  (no data)"]
+    lines = [
+        title,
+        f"{'Layer':<15} | {'Overlap (of top_k)':>18}",
+        f"{'-'*15}-+-{'-'*18}",
+    ]
+    for r in sorted(rows, key=lambda r: r["overlap"]):
+        lines.append(f"{r['layer']:<15} | {r['overlap']:>18}")
+    return lines
