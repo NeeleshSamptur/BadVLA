@@ -569,7 +569,7 @@ def _split_indices(n, cal_fraction, seed):
 
 def compute_mahalanobis_by_group(clean_by_layer, trig_by_layer,
                                  cal_fraction: float = 0.5, seed: int = 0,
-                                 eps: float = 1e-6):
+                                 eps: float = 1e-6, cal_idx=None, test_idx=None):
     """Per-layer diagonal Mahalanobis + a group-level detection AUROC.
 
     Operates on raw pooled activations (no upfront normalization). Diagonal
@@ -587,7 +587,14 @@ def compute_mahalanobis_by_group(clean_by_layer, trig_by_layer,
     trig_by_layer  : {layer_label: [vec_scene0, vec_scene1, ...]}  (triggered run)
         Both keyed identically; index = scene order.
     cal_fraction   : fraction of clean scenes used to fit mu/sigma (rest are test)
+        Ignored when cal_idx/test_idx are given explicitly.
     seed           : RNG seed for the calibration/test scene split
+        Ignored when cal_idx/test_idx are given explicitly.
+    cal_idx, test_idx : optional pre-computed scene-index arrays. Pass these
+        when the caller already needs the same split elsewhere (e.g. to place
+        trigger vectors from a disjoint scene pool at the right test
+        positions) -- avoids relying on two separate `_split_indices` calls
+        with matching (n, cal_fraction, seed) reproducing the same split.
 
     Returns
     -------
@@ -605,7 +612,11 @@ def compute_mahalanobis_by_group(clean_by_layer, trig_by_layer,
     if n < 2:
         return {"rows": [], "auroc": float("nan"), "n_cal": 0, "n_test": n}
 
-    cal_idx, test_idx = _split_indices(n, cal_fraction, seed)
+    if cal_idx is None or test_idx is None:
+        cal_idx, test_idx = _split_indices(n, cal_fraction, seed)
+    else:
+        cal_idx = np.asarray(cal_idx)
+        test_idx = np.asarray(test_idx)
 
     rows = []
     # Accumulate summed squared-z per test scene for the group-level AUROC.

@@ -1,85 +1,53 @@
 #!/bin/bash
-# Local runner for paired clean-vs-triggered activation probe (trial_error/run_libero_probe.py).
+# Local runner for disjoint Mahalanobis activation probe.
 #
-# Select suite and trigger mode:
-#   SUITE   in {goal, object, spatial, 10}     (default: goal)
-#   TRIGGER in {block, mug, stick, both, all}  (default: both)
+# Fixed: libero_goal + white-pixel block trigger.
+# Split:  cal / clean-test / trigger from non-overlapping scenes.
 #
-# Trigger modes (same semantics as run_libero_eval_local.sh):
-#   block — same libero_* scene; triggered = white pixel overlay on images
-#   mug   — libero_* (clean) vs libero_*_with_mug; same task_id + episode_idx
-#   stick — libero_* vs libero_*_with_red_stick
-#   both / all — run block then mug back-to-back
-#
-# Naming (TAG=<suite>_<trigger>, e.g. goal_block):
-#   Model:   vla-scripts/<TAG>/trigger_sec/<TAG>_stage2_30000_chkpt
-#   Table:   trial_error/probe_logs/run_libero_probe_log_<TAG>.txt
-#   Run log: trial_error/probe_logs/run_<TAG>_<timestamp>.log
+# Optional env overrides:
+#   DISJOINT_N_CAL=200 DISJOINT_N_CLEAN_TEST=150 DISJOINT_N_TRIG=150
+#   GPU_ID=0
+#   CHECKPOINT=/path/to/chkpt
 #
 # Examples:
 #   ./run_libero_probe_local.sh
-#   SUITE=goal TRIGGER=block ./run_libero_probe_local.sh
-#   SUITE=goal TRIGGER=mug   ./run_libero_probe_local.sh
-#   SUITE=goal TRIGGER=both  NUM_TRIALS_PER_TASK=6 ./run_libero_probe_local.sh
+#   DISJOINT_N_CAL=200 DISJOINT_N_CLEAN_TEST=150 DISJOINT_N_TRIG=150 ./run_libero_probe_local.sh
 
 set -euo pipefail
 
 ROOT="/home/grads/nsamptur/vla_bkd_def"
-SUITE="${SUITE:-goal}"
-TRIGGER="${TRIGGER:-both}"
-NUM_TRIALS_PER_TASK="${NUM_TRIALS_PER_TASK:-6}"
+SUITE="goal"
+TRIGGER="block"
+TAG="${SUITE}_${TRIGGER}"
 GPU_ID="${GPU_ID:-0}"
 
-case "${SUITE}" in
-  goal|object|spatial|10) ;;
-  *) echo "ERROR: SUITE must be goal|object|spatial|10 (got '${SUITE}')"; exit 1 ;;
-esac
+DISJOINT_N_CAL="${DISJOINT_N_CAL:-200}"
+DISJOINT_N_CLEAN_TEST="${DISJOINT_N_CLEAN_TEST:-150}"
+DISJOINT_N_TRIG="${DISJOINT_N_TRIG:-150}"
 
-run_one_probe() {
-  local trigger="$1"
-  local tag="${SUITE}_${trigger}"
-  local checkpoint="${CHECKPOINT:-${ROOT}/BadVLA/vla-scripts/${tag}/trigger_sec/${tag}_stage2_30000_chkpt}"
-  local run_ts
-  run_ts="$(date +%Y%m%d_%H%M%S)"
-  local probe_log_dir="${ROOT}/BadVLA/trial_error/probe_logs"
-  local run_log="${probe_log_dir}/run_${tag}_${run_ts}.log"
-  local out_table="${probe_log_dir}/run_libero_probe_log_${tag}.txt"
+if [[ "${DISJOINT_N_CLEAN_TEST}" -ne "${DISJOINT_N_TRIG}" ]]; then
+  echo "ERROR: DISJOINT_N_CLEAN_TEST (${DISJOINT_N_CLEAN_TEST}) must equal DISJOINT_N_TRIG (${DISJOINT_N_TRIG})"
+  exit 1
+fi
 
-  mkdir -p "${probe_log_dir}"
+n_total=$((DISJOINT_N_CAL + DISJOINT_N_CLEAN_TEST + DISJOINT_N_TRIG))
+if (( n_total % 10 != 0 )); then
+  echo "ERROR: n_cal+n_clean_test+n_trig=${n_total} must be divisible by 10 (libero_goal tasks)"
+  exit 1
+fi
+eps_per_task=$((n_total / 10))
 
-  if [[ ! -d "${checkpoint}" ]]; then
-    echo "ERROR: checkpoint not found: ${checkpoint}"
-    echo "Train it first: SUITE=${SUITE} TRIGGER=${trigger} STAGE=all ./run_train_local.sh"
-    exit 1
-  fi
+CHECKPOINT="${CHECKPOINT:-${ROOT}/BadVLA/vla-scripts/${TAG}/trigger_sec/${TAG}_stage2_30000_chkpt}"
+run_ts="$(date +%Y%m%d_%H%M%S)"
+probe_log_dir="${ROOT}/BadVLA/trial_error/probe_logs"
+run_log="${probe_log_dir}/run_${TAG}_${run_ts}.log"
+mkdir -p "${probe_log_dir}"
 
-  echo "================================================================"
-  echo "BadVLA probe  TAG=${tag}  (libero_${SUITE} + ${trigger} trigger)"
-  echo "================================================================"
-  echo "Model checkpoint:"
-  echo "  ${checkpoint}"
-  echo "Summary table:"
-  echo "  ${out_table}"
-  echo "Run log:"
-  echo "  ${run_log}"
-  echo "Trials per task: ${NUM_TRIALS_PER_TASK}"
-  echo "GPU: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
-  echo "================================================================"
-
-  cd "${ROOT}/BadVLA"
-  python trial_error/run_libero_probe.py \
-    --pretrained_checkpoint "${checkpoint}" \
-    --task_suite_name "libero_${SUITE}" \
-    --probe_trigger "${trigger}" \
-    --num_trials_per_task "${NUM_TRIALS_PER_TASK}" \
-    2>&1 | tee "${run_log}"
-
-  echo ""
-  echo "Done (TAG=${tag})"
-  echo "  Table: ${out_table}"
-  echo "  Log:   ${run_log}"
-  echo "================================================================"
-}
+if [[ ! -d "${CHECKPOINT}" ]]; then
+  echo "ERROR: checkpoint not found: ${CHECKPOINT}"
+  echo "Train it first: SUITE=${SUITE} TRIGGER=${TRIGGER} STAGE=all ./run_train_local.sh"
+  exit 1
+fi
 
 source "${HOME}/miniconda3/etc/profile.d/conda.sh"
 conda activate openvla-oft
@@ -89,20 +57,31 @@ export MUJOCO_GL=egl
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-16}"
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 
-case "${TRIGGER}" in
-  block|mug|stick)
-    run_one_probe "${TRIGGER}"
-    ;;
-  both|all)
-    run_one_probe block
-    echo ""
-    run_one_probe mug
-    ;;
-  *)
-    echo "ERROR: TRIGGER must be block|mug|stick|both|all (got '${TRIGGER}')"
-    exit 1
-    ;;
-esac
+echo "================================================================"
+echo "BadVLA probe  TAG=${TAG}  DISJOINT Mahalanobis"
+echo "================================================================"
+echo "Suite/trigger: libero_${SUITE} + ${TRIGGER}"
+echo "Split: cal=${DISJOINT_N_CAL}  clean-test=${DISJOINT_N_CLEAN_TEST}  trig=${DISJOINT_N_TRIG}"
+echo "Total scenes: ${n_total}  (${eps_per_task} episodes/task x 10 tasks)"
+echo "Model checkpoint:"
+echo "  ${CHECKPOINT}"
+echo "Run log:"
+echo "  ${run_log}"
+echo "GPU: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+echo "================================================================"
+
+cd "${ROOT}/BadVLA"
+python trial_error/run_libero_probe.py \
+  --pretrained_checkpoint "${CHECKPOINT}" \
+  --task_suite_name "libero_${SUITE}" \
+  --probe_trigger "${TRIGGER}" \
+  --disjoint_mahalanobis True \
+  --disjoint_n_cal "${DISJOINT_N_CAL}" \
+  --disjoint_n_clean_test "${DISJOINT_N_CLEAN_TEST}" \
+  --disjoint_n_trig "${DISJOINT_N_TRIG}" \
+  2>&1 | tee "${run_log}"
 
 echo ""
-echo "All requested probe runs finished (SUITE=${SUITE} TRIGGER=${TRIGGER})."
+echo "Done (TAG=${TAG})"
+echo "  Log: ${run_log}"
+echo "================================================================"

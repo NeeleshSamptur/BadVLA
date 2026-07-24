@@ -121,6 +121,7 @@ from trial_error.paired_probe import (
     compute_mahalanobis_by_group,
     format_summary,
     set_probe_quiet,
+    _split_indices,
 )
 # ==============================================================================
 
@@ -276,6 +277,19 @@ class GenerateConfig:
     # Set to 0.0 to skip Mahalanobis entirely (faster runs).
     cal_fraction: float = 0.5
 
+    # If True: use a fully disjoint scene split for Mahalanobis instead of the
+    # default paired same-scene split above -- calibration, clean-test, and
+    # trigger each draw from non-overlapping scene pools, so no scene index is
+    # ever reused across the three roles. Forces task_suite_name=libero_goal,
+    # probe_trigger=block, and cal_fraction=disjoint_n_cal/(disjoint_n_cal+
+    # disjoint_n_clean_test) (see validate_config). Requires libero_goal's 10
+    # tasks x 50 predefined init states to evenly cover disjoint_n_cal +
+    # disjoint_n_clean_test + disjoint_n_trig scenes.
+    disjoint_mahalanobis: bool = False
+    disjoint_n_cal: int = 200
+    disjoint_n_clean_test: int = 150
+    disjoint_n_trig: int = 150
+
     # fmt: on
 
     trigger: bool = False
@@ -315,6 +329,18 @@ def validate_config(cfg: GenerateConfig) -> None:
             cfg.task_suite_name,
         )
         cfg.trigger = False
+
+    if cfg.disjoint_mahalanobis:
+        assert cfg.probe_trigger == "block", (
+            "disjoint_mahalanobis currently only supports probe_trigger=block "
+            f"(got {cfg.probe_trigger!r})"
+        )
+        assert cfg.disjoint_n_clean_test == cfg.disjoint_n_trig, (
+            "disjoint_n_clean_test must equal disjoint_n_trig -- they're paired "
+            "1:1 into test slots (see run_single_probe)"
+        )
+        cfg.task_suite_name = "libero_goal"
+        cfg.cal_fraction = cfg.disjoint_n_cal / (cfg.disjoint_n_cal + cfg.disjoint_n_clean_test)
 
 
 def initialize_model(cfg: GenerateConfig):
@@ -636,8 +662,10 @@ def run_task(
         task_suite_trig=None,
         capture=None,
         hook_groups=None,
+        num_episodes=None,  # override cfg.num_trials_per_task (used by disjoint_mahalanobis)
 ):
     """Run the paired probe for every sampled scene of a single task."""
+    n_episodes = cfg.num_trials_per_task if num_episodes is None else num_episodes
     # Get task (clean / base suite)
     task = task_suite.get_task(task_id)
 
@@ -664,7 +692,7 @@ def run_task(
     # Sample a few initial states per task and probe each one.
     # PROBE CHANGE: each "episode" is now ONE paired (clean vs triggered) scene,
     # not a full rollout. We collect metrics instead of success/videos.
-    for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
+    for episode_idx in tqdm.tqdm(range(n_episodes)):
         log_message(f"\nTask: {task_description}", log_file)
 
         initial_state = _resolve_initial_state(
@@ -792,6 +820,17 @@ def run_single_probe(cfg: GenerateConfig) -> float:
         noisy_action_projector=noisy_action_projector,
     )
 
+    # disjoint_mahalanobis needs an exact, evenly-divisible scene count across
+    # tasks so the cal/clean-test/trigger split below lands on whole scenes.
+    disjoint_episodes_per_task = None
+    if cfg.disjoint_mahalanobis:
+        n_total = cfg.disjoint_n_cal + cfg.disjoint_n_clean_test + cfg.disjoint_n_trig
+        assert n_total % num_tasks == 0, (
+            f"disjoint_mahalanobis: n_cal+n_clean_test+n_trig={n_total} must be "
+            f"evenly divisible by num_tasks={num_tasks}"
+        )
+        disjoint_episodes_per_task = n_total // num_tasks
+
     all_metrics = []
     set_probe_quiet(True)
     try:
@@ -811,6 +850,7 @@ def run_single_probe(cfg: GenerateConfig) -> float:
                 task_suite_trig=task_suite_trig,
                 capture=capture,
                 hook_groups=hook_groups,
+                num_episodes=disjoint_episodes_per_task,
             )
     finally:
         hook_groups.remove()
@@ -855,16 +895,57 @@ def run_single_probe(cfg: GenerateConfig) -> float:
                     clean_vecs[grp].setdefault(lbl, []).append(c_vec)
                     trig_vecs[grp].setdefault(lbl, []).append(t_vec)
 
-        for grp in clean_vecs:
-            if not clean_vecs[grp]:
-                continue
-            maha_by_group[grp] = compute_mahalanobis_by_group(
-                clean_vecs[grp], trig_vecs[grp],
-                cal_fraction=cfg.cal_fraction,
-                seed=cfg.seed,
+        if cfg.disjoint_mahalanobis:
+            # Fully disjoint scene split: calibration and clean-test come from
+            # the first (n_cal + n_clean_test) scenes (in run_task/run_episode
+            # order == task-major, episode-minor); trigger scores come from a
+            # separate, non-overlapping pool of the last n_trig scenes. No
+            # scene index is reused across the three roles.
+            n_cal_test = cfg.disjoint_n_cal + cfg.disjoint_n_clean_test
+            n_scenes_collected = len(all_metrics)
+            assert n_scenes_collected == n_cal_test + cfg.disjoint_n_trig, (
+                f"disjoint_mahalanobis: collected {n_scenes_collected} scenes, "
+                f"expected {n_cal_test + cfg.disjoint_n_trig}"
             )
-            auc = maha_by_group[grp].get("auroc", float("nan"))
-            log_message(f"  Maha [{grp:>15}] AUROC={auc:.4f}", log_file)
+            cal_idx, test_idx = _split_indices(n_cal_test, cfg.cal_fraction, seed=cfg.seed)
+            disjoint_trig_scenes = np.arange(n_cal_test, n_scenes_collected)
+            assert len(test_idx) == len(disjoint_trig_scenes)
+
+            for grp in clean_vecs:
+                if not clean_vecs[grp]:
+                    continue
+                clean_by_layer, trig_by_layer = {}, {}
+                for lbl, vecs in clean_vecs[grp].items():
+                    if len(vecs) < n_scenes_collected:
+                        continue  # hook didn't fire every scene; skip for clean alignment
+                    clean_slots = vecs[:n_cal_test]
+                    trig_all = trig_vecs[grp][lbl]
+                    # NaN placeholder at cal_idx positions: never read (mu/sigma
+                    # are fit from clean-only calibration), so a stray future
+                    # read fails loudly instead of looking like real data.
+                    trig_slots = [np.full_like(vecs[0], np.nan) for _ in range(n_cal_test)]
+                    for pos, scene_i in zip(test_idx, disjoint_trig_scenes):
+                        trig_slots[pos] = trig_all[scene_i]
+                    clean_by_layer[lbl] = clean_slots
+                    trig_by_layer[lbl] = trig_slots
+                if not clean_by_layer:
+                    continue
+                maha_by_group[grp] = compute_mahalanobis_by_group(
+                    clean_by_layer, trig_by_layer, cal_idx=cal_idx, test_idx=test_idx,
+                )
+                auc = maha_by_group[grp].get("auroc", float("nan"))
+                log_message(f"  Maha [{grp:>15}] AUROC={auc:.4f}  (disjoint split)", log_file)
+        else:
+            for grp in clean_vecs:
+                if not clean_vecs[grp]:
+                    continue
+                maha_by_group[grp] = compute_mahalanobis_by_group(
+                    clean_vecs[grp], trig_vecs[grp],
+                    cal_fraction=cfg.cal_fraction,
+                    seed=cfg.seed,
+                )
+                auc = maha_by_group[grp].get("auroc", float("nan"))
+                log_message(f"  Maha [{grp:>15}] AUROC={auc:.4f}", log_file)
     elif cfg.cal_fraction == 0.0:
         log_message("Mahalanobis skipped (cal_fraction=0.0).", log_file)
     else:
