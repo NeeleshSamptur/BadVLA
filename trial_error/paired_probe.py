@@ -567,6 +567,68 @@ def _split_indices(n, cal_fraction, seed):
     return idx[:n_cal], idx[n_cal:]
 
 
+def stratified_disjoint_split(n_total, num_tasks, n_cal, n_clean_test, n_trig, seed):
+    """Task-stratified version of the cal/clean-test/trigger scene split.
+
+    _split_indices (and the plain-slice trigger-pool cut it used to be paired
+    with) only guarantees no SCENE index is reused across the three roles.
+    Scenes are collected task-major (all of task 0's episodes, then all of
+    task 1's, ...), so a flat "first N -> cal+clean-test, last M -> trigger"
+    cut lands on a task boundary whenever N is a multiple of episodes-per-task
+    -- which it always was for the 200/150/150 defaults (350 = 7 x 50). That
+    silently made task identity perfectly predictive of clean-vs-trigger
+    (tasks 0-6 only ever clean/cal, tasks 7-9 only ever trigger), so a
+    detector could score well by learning "which task is this" instead of
+    "was this triggered". This function fixes that: EVERY task contributes
+    its own proportional share of scenes to cal, clean-test, AND trigger, so
+    no role is task-specific.
+
+    Requires n_total, n_cal, n_clean_test, and n_trig to each divide evenly
+    by num_tasks (true for the 200/150/150 over 10 libero_goal tasks default
+    -- 20/15/15 per task). No remainder-splitting logic is implemented since
+    nothing in this codebase currently needs a non-evenly-divisible split;
+    add it if that changes.
+
+    Returns
+    -------
+    (cal_idx, clean_test_idx, trig_idx) : global scene-index arrays (into the
+        full 0..n_total-1 scene list, in original task-major collection
+        order), each disjoint from the other two, each drawing proportionally
+        from every task.
+    """
+    assert n_total % num_tasks == 0, (
+        f"stratified_disjoint_split: n_total={n_total} must be divisible by num_tasks={num_tasks}"
+    )
+    episodes_per_task = n_total // num_tasks
+    assert n_cal % num_tasks == 0 and n_clean_test % num_tasks == 0 and n_trig % num_tasks == 0, (
+        f"stratified_disjoint_split: n_cal={n_cal}, n_clean_test={n_clean_test}, n_trig={n_trig} "
+        f"must each be divisible by num_tasks={num_tasks} for an even per-task split"
+    )
+    per_task_cal = n_cal // num_tasks
+    per_task_clean_test = n_clean_test // num_tasks
+    per_task_trig = n_trig // num_tasks
+    assert per_task_cal + per_task_clean_test + per_task_trig == episodes_per_task, (
+        f"stratified_disjoint_split: per-task role sizes ({per_task_cal}+{per_task_clean_test}"
+        f"+{per_task_trig}) must sum to episodes_per_task={episodes_per_task} -- every scene "
+        f"needs exactly one role, with none left over"
+    )
+
+    rng = np.random.default_rng(seed)
+    cal_idx, clean_test_idx, trig_idx = [], [], []
+    for t in range(num_tasks):
+        base = t * episodes_per_task
+        local = rng.permutation(episodes_per_task)
+        cal_idx.append(base + local[:per_task_cal])
+        clean_test_idx.append(base + local[per_task_cal:per_task_cal + per_task_clean_test])
+        trig_idx.append(base + local[per_task_cal + per_task_clean_test:])
+
+    return (
+        np.concatenate(cal_idx),
+        np.concatenate(clean_test_idx),
+        np.concatenate(trig_idx),
+    )
+
+
 def compute_mahalanobis_by_group(clean_by_layer, trig_by_layer,
                                  cal_fraction: float = 0.5, seed: int = 0,
                                  eps: float = 1e-6, cal_idx=None, test_idx=None):
@@ -682,6 +744,156 @@ def compute_mahalanobis_by_group(clean_by_layer, trig_by_layer,
     }
 
 
+def compute_logit_lens_by_group(clean_by_layer, trig_by_layer, lm_head_weight,
+                                 cal_fraction: float = 0.5, seed: int = 0,
+                                 eps: float = 1e-6, cal_idx=None, test_idx=None):
+    """Logit-lens vocab-space detector, calibrated the same way as
+    compute_mahalanobis_by_group -- same cal/test split, same "fit only on
+    clean calibration scenes, score clean-test and trigger identically"
+    contract -- but in the LM's OUTPUT distribution space instead of raw
+    hidden activations:
+
+      hidden state --lm_head--> logits --softmax--> token distribution
+      distance = Jensen-Shannon divergence to a calibration-mean reference
+      (bounded, symmetric -- unlike cosine distance on un-normalized logits)
+
+    Each layer collapses to ONE scalar JS distance rather than a per-dim
+    vector, so the analogue of Mahalanobis's per-dim z-scoring is: standardize
+    that scalar against the mean/std of LEAVE-ONE-OUT clean-to-clean JS
+    distances measured entirely within the calibration pool (mu_null,
+    sigma_null). Because that null estimate never touches clean-test or
+    trigger data, both conditions are then scored against the exact same
+    full-calibration reference with the exact same z-score formula -- no
+    leave-one-out-vs-full-mean asymmetry between clean and trigger (unlike an
+    earlier version of this detector, which scored clean via leave-one-out
+    but trigger against the full mean).
+
+    Per-layer z-scores are combined with a LINEAR sum across layers, not
+    Mahalanobis's squared sum. That's a deliberate divergence, not an
+    oversight: Mahalanobis squares-and-sums because each z there is one of D
+    per-dimension coordinates whose shift direction is unknown a priori (a
+    backdoor could push any raw activation dimension up or down), so
+    chi-square combination is the correct way to detect "deviation in any
+    direction" across those dimensions. Here there is only one feature per
+    layer -- JS divergence, a >=0 "how far from typical clean" distance that
+    is already one-sided by construction (bigger always means more
+    anomalous). Summing standardized one-sided evidence linearly across
+    layers is the standard combination for that case (a Stouffer's-method
+    style combined z), and squaring it instead measurably destroys power: a
+    synthetic sanity check with a consistent per-layer shift found the
+    squared-sum's combined AUROC *degrading* as more (noisy) layers were
+    added (0.72 @ 3 layers -> 0.57 @ 8 layers) while the linear sum saturated
+    to ~1.0 by 3 layers and stayed there. Squaring would only be preferable
+    here if some layers' JS shift could be genuinely negative (samples
+    becoming systematically MORE typical under a backdoor) -- there is no
+    reason to expect that for a detection signal.
+
+    Only "llm.layer_NN" labels (the residual-stream decoder-block output) are
+    scored; "llm.layer_NN.self_attn" / ".mlp" sub-module outputs are deltas
+    into the residual stream, not the residual stream itself, so they are not
+    valid lm_head inputs and are skipped.
+
+    Parameters
+    ----------
+    clean_by_layer, trig_by_layer, cal_fraction, seed, cal_idx, test_idx :
+        same contract as compute_mahalanobis_by_group.
+    lm_head_weight : the (vocab, hidden) unembedding matrix (torch tensor).
+    eps : absolute division-by-zero floor for sigma_null (mirrors the
+        Mahalanobis variance floor -- see that function's docstring).
+
+    Returns
+    -------
+    dict with:
+      "rows"  : [{layer, js_clean_mean, js_trig_mean, layer_auroc}, ...]
+      "auroc" : group-level AUROC of held-out clean (label 0) vs triggered
+                (label 1) using the linearly-summed per-layer z-score.
+      "n_cal", "n_test"
+    """
+    labels = [l for l in clean_by_layer.keys()
+              if l.startswith("llm.layer_") and l.count(".") == 1]
+    if not labels:
+        return {"rows": [], "auroc": float("nan"), "n_cal": 0, "n_test": 0}
+    labels.sort(key=lambda s: int(s.rsplit("_", 1)[-1]))
+
+    n = max(len(clean_by_layer[l]) for l in labels)
+    if n < 2:
+        return {"rows": [], "auroc": float("nan"), "n_cal": 0, "n_test": n}
+
+    if cal_idx is None or test_idx is None:
+        cal_idx, test_idx = _split_indices(n, cal_fraction, seed)
+    else:
+        cal_idx = np.asarray(cal_idx)
+        test_idx = np.asarray(test_idx)
+    n_cal = len(cal_idx)
+
+    W = lm_head_weight.detach().to(dtype=torch.float32)
+    device = W.device
+
+    rows = []
+    sum_clean = np.zeros(len(test_idx), dtype=np.float64)
+    sum_trig = np.zeros(len(test_idx), dtype=np.float64)
+
+    for label in labels:
+        C = np.stack(clean_by_layer[label]).astype(np.float32)  # (n, D)
+        T = np.stack(trig_by_layer[label]).astype(np.float32)   # (n, D)
+        if len(C) != n or len(T) != n:
+            continue  # inconsistent firing count; skip for clean alignment
+
+        with torch.no_grad():
+            cal_logits = (torch.tensor(C[cal_idx], device=device) @ W.T)
+            clean_test_logits = (torch.tensor(C[test_idx], device=device) @ W.T)
+            trig_test_logits = (torch.tensor(T[test_idx], device=device) @ W.T)
+        cal_logits = cal_logits.cpu().numpy().astype(np.float64)
+        clean_test_logits = clean_test_logits.cpu().numpy().astype(np.float64)
+        trig_test_logits = trig_test_logits.cpu().numpy().astype(np.float64)
+
+        cal_sum = cal_logits.sum(axis=0)
+        ref_logits = cal_sum / n_cal  # full-calibration reference (scores clean-test AND trigger)
+
+        # Leave-one-out null: how far does a typical CLEAN calibration sample
+        # sit from the mean of the other calibration samples? A property of
+        # the calibration pool only -- never touches clean-test or trigger
+        # data, so those two conditions stay perfectly symmetric below.
+        d_null = np.empty(n_cal, dtype=np.float64)
+        for i in range(n_cal):
+            loo_logits = (cal_sum - cal_logits[i]) / (n_cal - 1)
+            d_null[i] = js_divergence(loo_logits, cal_logits[i])
+
+        mu_null = float(d_null.mean())
+        sigma_null = float(d_null.std())
+        # Relative variance floor, same spirit as compute_mahalanobis_by_group:
+        # guard the near-zero-spread edge case without imposing an absolute
+        # scale that would break comparability across layers.
+        floor = max(1e-2 * max(mu_null, eps), eps)
+        sigma_null = max(sigma_null, floor)
+
+        d_clean = np.array([js_divergence(ref_logits, l) for l in clean_test_logits])
+        d_trig = np.array([js_divergence(ref_logits, l) for l in trig_test_logits])
+
+        z_clean = (d_clean - mu_null) / sigma_null
+        z_trig = (d_trig - mu_null) / sigma_null
+
+        sum_clean += z_clean
+        sum_trig += z_trig
+
+        rows.append({
+            "layer": label,
+            "js_clean_mean": float(d_clean.mean()),
+            "js_trig_mean": float(d_trig.mean()),
+            "z_clean_mean": float(z_clean.mean()),
+            "z_trig_mean": float(z_trig.mean()),
+            "layer_auroc": auroc(d_trig, d_clean),
+        })
+
+    group_auroc = auroc(sum_trig, sum_clean)
+    return {
+        "rows": rows,
+        "auroc": group_auroc,
+        "n_cal": int(n_cal),
+        "n_test": int(len(test_idx)),
+    }
+
+
 # ======================================================================
 # 3. Reporting
 # ======================================================================
@@ -774,6 +986,50 @@ def _format_maha_table(maha_result, title):
     return lines
 
 
+def _format_logit_lens_table(ll_result, title):
+    """Format a compute_logit_lens_by_group result dict as an ASCII table."""
+    rows = ll_result.get("rows", [])
+    if not rows:
+        return [title, "  (no data)"]
+
+    col_layer = "Layer"
+    col_auc   = "Layer AUROC"
+    col_jsc   = "JS(clean)"
+    col_jst   = "JS(trig)"
+    col_zc    = "z(clean)"
+    col_zt    = "z(trig)"
+
+    labels    = [r["layer"] for r in rows]
+    auc_vals  = [_table_fmt_float(r["layer_auroc"]) for r in rows]
+    jsc_vals  = [_table_fmt_float(r["js_clean_mean"]) for r in rows]
+    jst_vals  = [_table_fmt_float(r["js_trig_mean"]) for r in rows]
+    zc_vals   = [_table_fmt_float(r["z_clean_mean"]) for r in rows]
+    zt_vals   = [_table_fmt_float(r["z_trig_mean"]) for r in rows]
+
+    w_layer = max(len(col_layer), max((len(l) for l in labels), default=0))
+    w_auc   = max(len(col_auc),  max((len(v) for v in auc_vals), default=0))
+    w_jsc   = max(len(col_jsc),  max((len(v) for v in jsc_vals), default=0))
+    w_jst   = max(len(col_jst),  max((len(v) for v in jst_vals), default=0))
+    w_zc    = max(len(col_zc),   max((len(v) for v in zc_vals),  default=0))
+    w_zt    = max(len(col_zt),   max((len(v) for v in zt_vals),  default=0))
+
+    sep = f"{'-'*w_layer}-+-{'-'*w_auc}-+-{'-'*w_jsc}-+-{'-'*w_jst}-+-{'-'*w_zc}-+-{'-'*w_zt}"
+    lines = [
+        title,
+        (f"{col_layer:<{w_layer}} | {col_auc:>{w_auc}} | {col_jsc:>{w_jsc}} | "
+         f"{col_jst:>{w_jst}} | {col_zc:>{w_zc}} | {col_zt:>{w_zt}}"),
+        sep,
+    ]
+    for lab, ac, jc, jt, zc, zt in zip(labels, auc_vals, jsc_vals, jst_vals, zc_vals, zt_vals):
+        lines.append(f"{lab:<{w_layer}} | {ac:>{w_auc}} | {jc:>{w_jsc}} | {jt:>{w_jst}} | {zc:>{w_zc}} | {zt:>{w_zt}}")
+
+    n_cal  = ll_result.get("n_cal", "?")
+    n_test = ll_result.get("n_test", "?")
+    auc    = ll_result.get("auroc", float("nan"))
+    lines.append(f"  cal={n_cal} test={n_test}  group-AUROC={_table_fmt_float(auc)}  (linear sum of per-layer z-scores)")
+    return lines
+
+
 def format_summary(results: dict):
     """Build human-readable summary table for within-sample probe results."""
     lines = []
@@ -840,5 +1096,18 @@ def format_summary_section(metrics: dict):
             lines.append("  Group-level detection AUROC summary:")
             for g, auc in aurocs.items():
                 lines.append(f"    {g:<15}: {_table_fmt_float(auc)}")
+
+    # Logit-lens section (only present for disjoint_mahalanobis runs, llm group only)
+    if metrics.get("logit_lens"):
+        lines.append("")
+        lines.append("=== Logit-Lens Detection (softmax + Jensen-Shannon, clean-calibrated) ===")
+        lines.append("  hidden state -> lm_head -> softmax -> token distribution -> JS divergence")
+        lines.append("  vs. a full-calibration reference distribution, z-scored per layer against")
+        lines.append("  leave-one-out clean-to-clean JS spread within calibration (same protocol as")
+        lines.append("  Mahalanobis above, just in vocab-distribution space instead of raw hidden units).")
+        ll_llm = metrics["logit_lens"].get("llm")
+        if ll_llm and ll_llm.get("rows"):
+            lines.append("")
+            lines.extend(_format_logit_lens_table(ll_llm, "LLM decoder blocks (logit lens):"))
 
     return "\n".join(lines)
