@@ -567,6 +567,68 @@ def _split_indices(n, cal_fraction, seed):
     return idx[:n_cal], idx[n_cal:]
 
 
+def stratified_disjoint_split(n_total, num_tasks, n_cal, n_clean_test, n_trig, seed):
+    """Task-stratified version of the cal/clean-test/trigger scene split.
+
+    _split_indices (and the plain-slice trigger-pool cut it used to be paired
+    with) only guarantees no SCENE index is reused across the three roles.
+    Scenes are collected task-major (all of task 0's episodes, then all of
+    task 1's, ...), so a flat "first N -> cal+clean-test, last M -> trigger"
+    cut lands on a task boundary whenever N is a multiple of episodes-per-task
+    -- which it always was for the 200/150/150 defaults (350 = 7 x 50). That
+    silently made task identity perfectly predictive of clean-vs-trigger
+    (tasks 0-6 only ever clean/cal, tasks 7-9 only ever trigger), so a
+    detector could score well by learning "which task is this" instead of
+    "was this triggered". This function fixes that: EVERY task contributes
+    its own proportional share of scenes to cal, clean-test, AND trigger, so
+    no role is task-specific.
+
+    Requires n_total, n_cal, n_clean_test, and n_trig to each divide evenly
+    by num_tasks (true for the 200/150/150 over 10 libero_goal tasks default
+    -- 20/15/15 per task). No remainder-splitting logic is implemented since
+    nothing in this codebase currently needs a non-evenly-divisible split;
+    add it if that changes.
+
+    Returns
+    -------
+    (cal_idx, clean_test_idx, trig_idx) : global scene-index arrays (into the
+        full 0..n_total-1 scene list, in original task-major collection
+        order), each disjoint from the other two, each drawing proportionally
+        from every task.
+    """
+    assert n_total % num_tasks == 0, (
+        f"stratified_disjoint_split: n_total={n_total} must be divisible by num_tasks={num_tasks}"
+    )
+    episodes_per_task = n_total // num_tasks
+    assert n_cal % num_tasks == 0 and n_clean_test % num_tasks == 0 and n_trig % num_tasks == 0, (
+        f"stratified_disjoint_split: n_cal={n_cal}, n_clean_test={n_clean_test}, n_trig={n_trig} "
+        f"must each be divisible by num_tasks={num_tasks} for an even per-task split"
+    )
+    per_task_cal = n_cal // num_tasks
+    per_task_clean_test = n_clean_test // num_tasks
+    per_task_trig = n_trig // num_tasks
+    assert per_task_cal + per_task_clean_test + per_task_trig == episodes_per_task, (
+        f"stratified_disjoint_split: per-task role sizes ({per_task_cal}+{per_task_clean_test}"
+        f"+{per_task_trig}) must sum to episodes_per_task={episodes_per_task} -- every scene "
+        f"needs exactly one role, with none left over"
+    )
+
+    rng = np.random.default_rng(seed)
+    cal_idx, clean_test_idx, trig_idx = [], [], []
+    for t in range(num_tasks):
+        base = t * episodes_per_task
+        local = rng.permutation(episodes_per_task)
+        cal_idx.append(base + local[:per_task_cal])
+        clean_test_idx.append(base + local[per_task_cal:per_task_cal + per_task_clean_test])
+        trig_idx.append(base + local[per_task_cal + per_task_clean_test:])
+
+    return (
+        np.concatenate(cal_idx),
+        np.concatenate(clean_test_idx),
+        np.concatenate(trig_idx),
+    )
+
+
 def compute_mahalanobis_by_group(clean_by_layer, trig_by_layer,
                                  cal_fraction: float = 0.5, seed: int = 0,
                                  eps: float = 1e-6, cal_idx=None, test_idx=None):
