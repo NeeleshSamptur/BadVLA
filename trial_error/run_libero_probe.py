@@ -119,6 +119,8 @@ from trial_error.paired_probe import (
     compute_all_probe_metrics,
     extract_pooled_by_group,
     compute_mahalanobis_by_group,
+    compute_logit_lens_by_group,
+    compute_vocab_cosine_by_group,
     format_summary,
     set_probe_quiet,
     _split_indices,
@@ -779,8 +781,72 @@ def eval_libero(cfg: GenerateConfig) -> float:
     return run_single_probe(cfg)
 
 
+def _results_header(cfg: "GenerateConfig", maha_by_group: dict,
+                    logit_lens_by_group: dict, vocab_cosine_by_group: dict) -> str:
+    """Headline AUROC block prepended to the summary table.
+
+    Every detector's per-layer detail is already tabulated by format_summary
+    (see paired_probe.format_summary_section's Mahalanobis / Logit-Lens /
+    Vocab-Cosine sections), so this deliberately adds no new tables -- it only
+    hoists "what were the three numbers" to the top of the file so they do not
+    have to be hunted for among hundreds of per-layer rows. One results file,
+    headline first, detail below.
+    """
+    ll_auc = (logit_lens_by_group or {}).get("llm", {}).get("auroc", float("nan"))
+    vc_auc = (vocab_cosine_by_group or {}).get("llm", {}).get("auroc", float("nan"))
+    maha_llm = (maha_by_group or {}).get("llm", {}).get("auroc", float("nan"))
+
+    lines = [
+        "=" * 78,
+        "BadVLA backdoor probe -- clean vs trigger",
+        "=" * 78,
+        f"checkpoint:  {cfg.pretrained_checkpoint}",
+        f"task suite:  {cfg.task_suite_name}  (probe_trigger={cfg.probe_trigger})",
+    ]
+    if cfg.disjoint_mahalanobis:
+        lines.append(
+            f"split:       cal={cfg.disjoint_n_cal}  clean-test={cfg.disjoint_n_clean_test}  "
+            f"trigger={cfg.disjoint_n_trig}  (disjoint pools, task-stratified)"
+        )
+        lines.append(
+            "             All detectors share this split, the clean-only calibration, and the"
+        )
+        lines.append(
+            "             'score clean-test and trigger identically' contract, so their AUROCs"
+        )
+        lines.append(
+            "             are directly comparable -- only the distance function differs."
+        )
+    lines.append("")
+    lines.append("HEADLINE DETECTION AUROC (llm group, all layers combined)")
+    lines.append(f"  [1] mahalanobis  = {maha_llm:.4f}   raw activations, per-dim z, squared sum")
+    lines.append(f"  [2] logit lens   = {ll_auc:.4f}   lm_head -> softmax -> JS, linear z-sum")
+    lines.append(f"  [3] vocab cosine = {vc_auc:.4f}   lm_head -> cosine on raw logits, linear z-sum")
+
+    if maha_by_group:
+        lines.append("")
+        lines.append("Mahalanobis AUROC by group (only detector that covers non-llm groups):")
+        for grp, res in maha_by_group.items():
+            auc = res.get("auroc", float("nan"))
+            lines.append(f"  {grp:<15}: {auc:.4f}")
+
+    lines += [
+        "",
+        "Per-layer tables for every detector and every group follow below.",
+        "=" * 78,
+        "",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def run_single_probe(cfg: GenerateConfig) -> float:
-    """Paired clean-vs-triggered activation probe over LIBERO tasks."""
+    """Paired clean-vs-triggered activation probe over LIBERO tasks.
+
+    Writes ONE results file (probe_output_path): a headline AUROC block for all
+    three detectors followed by every per-layer table. There is no separate
+    per-detector log -- one simulator pass produces one set of results, so
+    splitting them across files only made the same numbers harder to find.
+    """
     validate_config(cfg)
     tag = probe_output_tag(cfg)
 
@@ -879,6 +945,11 @@ def run_single_probe(cfg: GenerateConfig) -> float:
     # Skipped if cal_fraction == 0 or too few scenes.
     # ----------------------------------------------------------------
     maha_by_group: dict = {}
+    # Logit-lens (llm group only, disjoint_mahalanobis runs only -- see
+    # compute_logit_lens_by_group for why it needs the same cal/test split).
+    logit_lens_by_group: dict = {}
+    # Vocab-cosine (same conditions as logit-lens -- llm group, disjoint runs).
+    vocab_cosine_by_group: dict = {}
     if cfg.cal_fraction > 0.0 and len(all_metrics) >= 4 and all_metrics:
         log_message(
             f"Computing Mahalanobis (cal_fraction={cfg.cal_fraction}, "
@@ -919,11 +990,11 @@ def run_single_probe(cfg: GenerateConfig) -> float:
                 cfg.disjoint_n_cal, cfg.disjoint_n_clean_test, cfg.disjoint_n_trig,
                 seed=cfg.seed,
             )
-            # compute_mahalanobis_by_group indexes clean_by_layer/trig_by_layer
-            # positionally (0..n_cal_test-1), not by real scene id -- so map
-            # local positions to the global, stratified scene indices just
-            # picked above. cal occupies local positions [0, n_cal); clean-test
-            # occupies [n_cal, n_cal_test).
+            # compute_mahalanobis_by_group / compute_logit_lens_by_group index
+            # clean_by_layer/trig_by_layer positionally (0..n_cal_test-1), not
+            # by real scene id -- so map local positions to the global,
+            # stratified scene indices just picked above. cal occupies local
+            # positions [0, n_cal); clean-test occupies [n_cal, n_cal_test).
             local_to_global_clean = np.concatenate([cal_scene_idx, clean_test_scene_idx])
             cal_idx = np.arange(len(cal_scene_idx))
             test_idx = np.arange(len(cal_scene_idx), n_cal_test)
@@ -953,6 +1024,38 @@ def run_single_probe(cfg: GenerateConfig) -> float:
                 )
                 auc = maha_by_group[grp].get("auroc", float("nan"))
                 log_message(f"  Maha [{grp:>15}] AUROC={auc:.4f}  (disjoint, task-stratified split)", log_file)
+
+                # Logit lens reuses the SAME disjoint clean_by_layer/trig_by_layer/
+                # cal_idx/test_idx built above for Mahalanobis -- one simulator
+                # pass feeds both detectors, and both see the identical scenes
+                # in the identical cal/clean-test/trigger roles. LLM group only:
+                # projecting through lm_head is only meaningful for the residual
+                # stream, not vision/proprio/action-head activations.
+                if grp == "llm":
+                    logit_lens_by_group[grp] = compute_logit_lens_by_group(
+                        clean_by_layer, trig_by_layer,
+                        lm_head_weight=model.language_model.lm_head.weight,
+                        cal_idx=cal_idx, test_idx=test_idx,
+                    )
+                    ll_auc = logit_lens_by_group[grp].get("auroc", float("nan"))
+                    log_message(
+                        f"  LogitLens [{grp:>11}] AUROC={ll_auc:.4f}  (disjoint, task-stratified split, softmax+JS, z-scored)",
+                        log_file,
+                    )
+                    # Vocab-cosine detector: same clean_by_layer/trig_by_layer,
+                    # same cal_idx/test_idx, so it sees the identical scenes in
+                    # the identical roles as Mahalanobis and logit-lens. Only
+                    # the distance function differs (cosine on raw logits).
+                    vocab_cosine_by_group[grp] = compute_vocab_cosine_by_group(
+                        clean_by_layer, trig_by_layer,
+                        lm_head_weight=model.language_model.lm_head.weight,
+                        cal_idx=cal_idx, test_idx=test_idx,
+                    )
+                    vc_auc = vocab_cosine_by_group[grp].get("auroc", float("nan"))
+                    log_message(
+                        f"  VocabCos  [{grp:>11}] AUROC={vc_auc:.4f}  (disjoint, task-stratified split, raw logits+cosine, z-scored)",
+                        log_file,
+                    )
         else:
             for grp in clean_vecs:
                 if not clean_vecs[grp]:
@@ -972,6 +1075,10 @@ def run_single_probe(cfg: GenerateConfig) -> float:
 
     if maha_by_group:
         agg["mahalanobis"] = maha_by_group
+    if logit_lens_by_group:
+        agg["logit_lens"] = logit_lens_by_group
+    if vocab_cosine_by_group:
+        agg["vocab_cosine"] = vocab_cosine_by_group
 
     results = {
         "within": agg,
@@ -984,7 +1091,8 @@ def run_single_probe(cfg: GenerateConfig) -> float:
     out_txt = probe_output_path(tag)
     # JSON output disabled — summary .txt only
     # save_log(results, path=out_json)
-    text = format_summary(results)
+    text = _results_header(cfg, maha_by_group, logit_lens_by_group,
+                           vocab_cosine_by_group) + format_summary(results)
     log_message("\n" + text, log_file)
     print(text, flush=True)
     with open(out_txt, "w") as f:

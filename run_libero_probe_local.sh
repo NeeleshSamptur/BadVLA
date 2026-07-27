@@ -1,5 +1,13 @@
 #!/bin/bash
-# Local runner for disjoint Mahalanobis activation probe.
+# Local runner for the disjoint-scene activation probe -- ALL THREE detectors.
+#
+# One simulator pass over the scenes feeds every detector, so there is no
+# reason to have a per-detector entry point: this script produces the
+# Mahalanobis, logit-lens, and vocab-cosine results together.
+#
+#   Mahalanobis   raw pooled activations, all hook groups
+#   Logit lens    lm_head -> softmax -> Jensen-Shannon, llm group only
+#   Vocab cosine  lm_head -> cosine on raw logits, llm group only
 #
 # Fixed: libero_goal + white-pixel block trigger.
 # Split:  cal / clean-test / trigger from non-overlapping scenes.
@@ -65,8 +73,9 @@ echo "Split: cal=${DISJOINT_N_CAL}  clean-test=${DISJOINT_N_CLEAN_TEST}  trig=${
 echo "Total scenes: ${n_total}  (${eps_per_task} episodes/task x 10 tasks)"
 echo "Model checkpoint:"
 echo "  ${CHECKPOINT}"
-echo "Run log:"
-echo "  ${run_log}"
+echo "Detectors: mahalanobis + logit-lens + vocab-cosine (one simulator pass)"
+echo "Progress log: ${run_log}"
+echo "Results file: ${probe_log_dir}/run_libero_probe_log_${TAG}_<timestamp>.txt  (resolved below)"
 echo "GPU: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 echo "================================================================"
 
@@ -81,7 +90,18 @@ python trial_error/run_libero_probe.py \
   --disjoint_n_trig "${DISJOINT_N_TRIG}" \
   2>&1 | tee "${run_log}"
 
+# The results filename is stamped by Python at import time (robot_utils.DATE_TIME),
+# not by run_ts above, so the two files have different timestamp formats -- resolve
+# the newest one rather than trying to reconstruct the name here.
+results_file="$(ls -t "${probe_log_dir}/run_libero_probe_log_${TAG}_"*.txt 2>/dev/null | head -1)"
+
 echo ""
-echo "Done (TAG=${TAG})"
-echo "  Log: ${run_log}"
 echo "================================================================"
+echo "Done (TAG=${TAG}).  Two files:"
+echo "  progress: ${run_log}"
+echo "  RESULTS:  ${results_file:-<none written>}"
+echo "================================================================"
+if [[ -n "${results_file}" ]]; then
+  echo ""
+  sed -n '1,/^====/p;/HEADLINE/,/^$/p' "${results_file}" | head -30
+fi
